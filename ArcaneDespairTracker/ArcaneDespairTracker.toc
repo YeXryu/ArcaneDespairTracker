@@ -1,0 +1,11 @@
+## Interface: 120100
+## Title: Arcane Despair Tracker
+## Notes: Counts Arcane Blasts cast without a Clearcasting proc and Arcane Barrages cast without a Prismatic Bolt proc.
+## Author: Mateusz Kurkiewicz
+## Version: 6.1.1
+## SavedVariablesPerCharacter: ArcaneDespairTrackerDB
+## IconTexture: Interface\Icons\Spell_Arcane_Blast
+## Category-enUS: Class
+## AllowLoadGameType: mainline
+
+Core.lua
