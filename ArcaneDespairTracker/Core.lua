@@ -12,8 +12,16 @@
     Midnight notes: COMBAT_LOG_EVENT_UNFILTERED is forbidden for addons since
     12.0 and aura data can be a Secret Value during encounters, M+ and rated
     PvP. Everything here is built on UNIT_SPELLCAST_SUCCEEDED, UNIT_AURA with
-    GetPlayerAuraBySpellID, C_Spell.GetOverrideSpell, and - when aura data is
-    unreadable - on the casts that can only exist because a proc existed.
+    GetPlayerAuraBySpellID, hooks on Blizzard's own Cooldown Manager items,
+    C_Spell.GetOverrideSpell, and - when none of those can see - on the casts
+    that can only exist because a proc existed.
+
+    WHAT THE PLAYER NEEDS SWITCHED ON: Blizzard's Cooldown Manager, with
+    Clearcasting and Prismatic Bolt on one of its tracked bars (Edit Mode ->
+    Cooldown Manager -> Tracked Buffs). That is the only signal that can see a
+    proc landing while you are already holding one. Without it the addon still
+    works, but falls back to weaker signals and stops counting Arcane Blasts
+    whose outcome it cannot observe. /adt status says which one is in use.
 
     /adt help
 ----------------------------------------------------------------------------]]
@@ -72,13 +80,21 @@ local CREDIT_TTL  = {       -- how long a counted proc may sit unconsumed
 
 -- The walkthrough pace. The longest built-in sound runs about 3.5 s, so a step
 -- shorter than this cuts each stage off before you have heard it.
-local PREVIEW_STEP = 3.6
-local PREVIEW_HOLD = 3.3
+local PREVIEW = { step = 3.6, hold = 3.3 }
 local REFRESH_EPS = 0.05    -- any rise in expirationTime is a reapplication
 local POLL_INTERVAL = 0.25  -- catches aura secrecy lifting, which fires no event
 local USABLE_GATE = 1.2     -- a usability flip only counts this soon after a cast
-local SAME_INSTANT = 0.15   -- two signals this close describe the same proc
-local DB_VERSION  = 4
+-- Two signals this close describe the same proc. It has to cover the gap
+-- between independent detectors reporting one event: the viewer hook answers
+-- next frame, the 0.25s poll can be a whole tick behind it. Anything shorter
+-- and one proc gets counted twice; anything much longer and two real procs a
+-- global cooldown apart could merge, which they never are.
+local SAME_INSTANT = 0.35
+-- How long an aura whose spell id was sealed stays claimable as "the proc that
+-- just landed". Long enough to survive the frame or two between the buff being
+-- applied and a detector noticing, short enough not to adopt a stranger.
+local ANON_ADD_TTL = 1.0
+local DB_VERSION  = 5
 
 ----------------------------------------------------------------------
 -- Strings
@@ -184,15 +200,6 @@ local function AuraIsSecretNow(spellID)
     return ok and res == true
 end
 
--- Every id for this proc is forbidden right now? Any single readable one is
--- enough to see stacks, and they can be flagged differently.
-local function AllAuraIDsSecret(ids)
-    for _, id in ipairs(ids) do
-        if not AuraIsSecretNow(id) then return false end
-    end
-    return true
-end
-
 local function ReadAura(spellID)
     if not (C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID) then return nil, "noapi" end
 
@@ -219,20 +226,33 @@ local function ReadAura(spellID)
 end
 
 ----------------------------------------------------------------------
--- Blizzard's own Cooldown Manager as a stack-count source
+-- Finding a proc's entry in Blizzard's Cooldown Manager
 --
--- Reading aura data is restricted, but Blizzard's Cooldown Manager *draws* the
--- stack count on screen from its own untainted code. C_CooldownViewer carries no
--- SecretWhen... annotation, and the number it renders is a plain FontString. So
--- we look up the viewer entry for the aura and read the digit it is showing.
--- Every step is wrapped: if any of it is secret or missing we just get nil.
+-- The digit it draws is a Secret Value in combat (measured: item.c3.Applications
+-- came back <SECRET>), so nothing here tries to read a stack count. What we want
+-- is the item frame itself: hooking it is how the proc engine sees a proc land
+-- while the aura payload is sealed. See "Cooldown Manager proc detector" below.
 ----------------------------------------------------------------------
-local VIEWER_CATEGORIES = { 2, 6 }   -- TrackedBuff, SpecAgnosticTracked
-local VIEWER_FRAMES = {
-    "BuffIconCooldownViewer", "BuffBarCooldownViewer",
-    "EssentialCooldownViewer", "UtilityCooldownViewer",
-}
-local STACK_TEXT_KEYS = { "Applications", "ApplicationsText", "Count", "CountText", "StackText" }
+-- Every category, not a guessed pair. The tracked-buff category number is not
+-- promised to stay put between patches, and an entry we cannot find is a
+-- detector that silently does not exist. The frames below already restrict this
+-- to buff bars, so a wide search costs nothing but is not allowed to go wrong.
+local VIEWER_CATEGORIES = {}
+do
+    local seen = {}
+    pcall(function()
+        for _, value in pairs(Enum.CooldownViewerCategory) do
+            if type(value) == "number" then seen[value] = true end
+        end
+    end)
+    for i = 0, 12 do seen[i] = true end
+    for value in pairs(seen) do table.insert(VIEWER_CATEGORIES, value) end
+    table.sort(VIEWER_CATEGORIES)
+end
+-- Buff bars only. The Essential and Utility viewers hold *abilities*, and their
+-- items redraw on every cooldown and global cooldown - reading one of those as
+-- a proc detector produced signals that had nothing to do with any buff.
+local VIEWER_FRAMES = { "BuffIconCooldownViewer", "BuffBarCooldownViewer" }
 
 local VIEWER_RETRY = 3.0
 local viewerIDCache = {}    -- [spellID] = { id = n } or { retryAt = t }
@@ -256,10 +276,12 @@ local function ViewerIDForSpell(spellID, learnInto)
                 if ok2 and type(info) == "table" then
                     local matched = false
                     pcall(function()
-                        if info.spellID == spellID or info.overrideSpellID == spellID then
-                            matched = true
-                            return
-                        end
+                        -- Deliberately not overrideSpellID. Prismatic Bolt is
+                        -- the override on the Arcane Blast entry, so matching
+                        -- that way handed back an ability item instead of the
+                        -- buff - a frame that never hides and redraws on every
+                        -- cooldown, which is not a proc detector at all.
+                        if info.spellID == spellID then matched = true return end
                         if type(info.linkedSpellIDs) == "table" then
                             for _, s in ipairs(info.linkedSpellIDs) do
                                 if s == spellID then matched = true return end
@@ -293,29 +315,9 @@ local function ViewerIDForSpell(spellID, learnInto)
     return found
 end
 
--- Pull a small integer out of any FontString this frame is showing.
-local function NumericTextOf(frame)
-    local value
-    pcall(function()
-        for _, key in ipairs(STACK_TEXT_KEYS) do
-            local fs = frame[key]
-            if fs and fs.GetText then
-                local n = tonumber(fs:GetText())
-                if n and n >= 1 and n <= 20 then value = n return end
-            end
-        end
-        if not frame.GetRegions then return end
-        for _, region in ipairs({ frame:GetRegions() }) do
-            if region and region.GetObjectType and region:GetObjectType() == "FontString"
-               and region.IsShown and region:IsShown() then
-                local n = tonumber(region:GetText())
-                if n and n >= 1 and n <= 20 then value = n return end
-            end
-        end
-    end)
-    return value
-end
-
+-- The Cooldown Manager item that draws this cooldownID, plus the bar it lives
+-- on. The bar matters: a Cooldown Manager the player has switched off in Edit
+-- Mode hides every item, and that must not read as "the proc is gone".
 local function ViewerItemFor(cooldownID)
     for _, frameName in ipairs(VIEWER_FRAMES) do
         local parent = _G[frameName]
@@ -328,7 +330,7 @@ local function ViewerItemFor(cooldownID)
                         if item.cooldownID == cooldownID then match = true
                         elseif item.GetCooldownID and item:GetCooldownID() == cooldownID then match = true end
                     end)
-                    if match then return item, frameName end
+                    if match then return item, parent, frameName end
                 end
             end
         end
@@ -336,31 +338,9 @@ local function ViewerItemFor(cooldownID)
     return nil
 end
 
--- Stack count as displayed by the Cooldown Manager, or nil.
--- Note Blizzard hides the digit at a single application, so "showing nothing"
--- means one stack when the buff is up at all.
-local function ViewerStacks(spellID)
-    local cooldownID = ViewerIDForSpell(spellID)
-    if not cooldownID then return nil end
-
-    local item, frameName = ViewerItemFor(cooldownID)
-    if not item then return nil end
-
-    local shown = false
-    pcall(function() shown = item.IsShown and item:IsShown() or false end)
-    if not shown then return nil end
-
-    -- Only report a count we actually read. Defaulting to 1 here was a mistake:
-    -- it pinned the believed stack count at 1 forever, which made every real
-    -- stack change look like no change and suppressed the aura path entirely.
-    local n = NumericTextOf(item)
-    if not n then return nil end
-    return n, frameName
-end
-
 -- Is a spell castable right now? nil = unreadable.
--- Arcane Missiles is only castable while you hold Clearcasting, which makes this
--- a proc detector that needs no aura data at all.
+-- Arcane Missiles usability is the last fallback, for clients where the Cooldown
+-- Manager detector is unavailable. It can only ever reveal 0 -> 1 stacks.
 local function ReadUsable(spellID)
     if not (C_Spell and C_Spell.IsSpellUsable) then return nil end
     local ok, usable = pcall(C_Spell.IsSpellUsable, spellID)
@@ -439,9 +419,13 @@ local DEFAULTS = {
         clownTimeout   = 3,      -- hide the face this long after the last Blast
         soundFiles     = {},     -- ["1".."5"] = your own .ogg, empty = that stage's own
         pauseWhenBlind = true,   -- do not count casts whose procs we cannot see
-        soulPause      = false,  -- optionally ignore Barrages cast during Arcane Soul
+        anyProcResets  = false,  -- any proc clears the strike, not just an earned one
+        faceDelay      = 0,      -- the face is best instant; a lagging one looks broken
+        soundDelay     = 0.4,    -- the sound waits, so a proc can cancel it
+        soulPause      = true,   -- ignore Barrages cast during Arcane Soul
         soulDelay      = 17.4,   -- Arcane Soul lands this long after Arcane Surge
         soulDuration   = 4,      -- and lasts this long
+        onboarded      = false,  -- the first-run walkthrough has been seen
     },
     ids     = {},
     learnedPB = {},          -- override ids seen for Prismatic Bolt, kept across reloads
@@ -461,6 +445,9 @@ local pbCasts = 0           -- Prismatic Bolts cast, this fight
 local soulFrom, soulTo = 0, 0   -- cast-derived Arcane Soul window
 local shameRun = { blast = 0, barrage = 0 }   -- bumped whenever a strike starts over
 local shameLastKey = {}                       -- guards a repeat sound for one strike
+-- The strike the face and the sound are allowed to react to. It lags the real
+-- one by the grace delay, so a proc arriving just after the cast beats it.
+local shameOk = { blast = 0, barrage = 0 }
 local DetectionLive         -- forward declaration; the UI marks blind counters
 local ResetStatsPublic      -- wired to ResetStats once it exists
 local ResetStatsSilent      -- same, without the chat line
@@ -472,10 +459,31 @@ local credits     = { blast = {}, barrage = {} }
 local auraState   = {}
 local auraStatus  = { blast = "?", barrage = "?" }
 local lastAuraSig = {}      -- debug: only log an aura poll when it changed
+local auraBlind   = {}      -- this aura was unreadable at the last poll
 local learnedPBCasts = {}
 local lastOverride
 local missilesUsable        -- nil = unknown / unreadable
 local lastAnyCast = 0       -- any player cast, used to gate the usability signal
+local lastConsumedAt = { blast = 0, barrage = 0 }  -- when the proc was last spent
+
+-- Cooldown Manager detector, one entry per counter.
+--   item    the viewer item frame that draws this proc
+--   hooked  our hooks are installed on it
+--   proven  ... and Blizzard has actually called one, so it really is a signal
+--   active  the item is showing, i.e. the proc is up (nil = cannot tell)
+local viewer = {
+    blast   = { kind = "blast",   hooked = false, proven = false },
+    barrage = { kind = "barrage", hooked = false, proven = false },
+}
+local hookedViewerItems = setmetatable({}, { __mode = "k" })
+
+-- Aura-instance detector state. Declared up here because the Cooldown Manager
+-- path borrows from it: when a proc reappears and exactly one aura was added in
+-- the same moment, that instance must be the one that just landed.
+local knownInstance = {}       -- [kind] = the auraInstanceID we believe is ours
+local anonymousAdds = nil      -- { ids = {...}, at = t } - added, spell id sealed
+local instanceQueued = {}
+local instanceReadable = false -- the game really does hand us those lists
 
 local function Debug(msg, ...)
     if not (DB and DB.opts.debug) then return end
@@ -653,7 +661,9 @@ local function UpdateShame(kind)
     if not f then return end
     local cfg = Shame(kind)
 
-    if placingKind == kind then
+    -- "all" is the walkthrough's placement step, which puts everything on screen
+    -- at once so it can be dragged where it belongs in one pass.
+    if placingKind == kind or placingKind == "all" then
         f.tex:SetTexture(MEDIA .. TIERS[kind][1].face)
         f:SetSize(cfg.size, cfg.size)
         f:Show()
@@ -673,7 +683,9 @@ local function UpdateShame(kind)
         end
     end
 
-    local streak = DB.total[kind].streak
+    -- Not the live strike: the one that has survived the grace delay. A proc
+    -- landing a moment after the cast rolls this back before it is ever drawn.
+    local streak = math.min(DB.total[kind].streak, shameOk[kind] or 0)
     local tier = TierFor(kind, streak)
     if not cfg.enabled or tier == 0 then f:Hide() return end
 
@@ -702,35 +714,41 @@ local function UpdateDisplay()
     if not ShouldShow() then frame:Hide() return end
     frame:Show()
 
+    -- Every piece has its own fixed column, so going from 9 to 10 moves nothing
+    -- but the digits themselves. The label, the "?" and the "proc" caption never
+    -- shift, and the percentage keeps its right edge.
     local pbRow = rows[3]
     if pbRow then
-        pbRow.main:SetText(string.format("%s%s %s%d|r",
-            L.CASTS_PREFIX, L.STRIKE_SEP, Hex(DB.colors.calm), pbCasts))
-        if DB.opts.showPB and DB.opts.showPBReset then
-            pbRow.reset:Show()
-        else
-            pbRow.reset:Hide()
-        end
+        pbRow.label:SetText(L.CASTS_PREFIX .. L.STRIKE_SEP)
+        pbRow.value:SetText(string.format("%s%d|r", Hex(DB.colors.calm), pbCasts))
+        -- Where it sits is ApplyLayout's business; whether it exists at all is
+        -- this one setting's, and it no longer depends on the row being shown.
+        if DB.opts.showPBReset then pbRow.reset:Show() else pbRow.reset:Hide() end
     end
 
     for _, entry in ipairs({ { "blast", rows[1] }, { "barrage", rows[2] } }) do
         local kind, row = entry[1], entry[2]
         local t = DB.total[kind]
 
-        -- Only Arcane Blast can pause, so only Arcane Blast gets the marker.
+        row.label:SetText(L.STRIKE_PREFIX .. L.STRIKE_SEP)
+        row.value:SetText(string.format("%s%d|r", StreakColor(t.streak), t.streak))
+
+        -- Only Arcane Blast can pause, so only Arcane Blast gets the marker. It
+        -- lives in its own column: appearing must not nudge the number.
         local mark = ""
         if kind == "blast" and DB.opts.pauseWhenBlind
            and DetectionLive and not DetectionLive(kind) then
             mark = Hex(DB.colors.mark) .. "?|r"
         end
-
-        row.main:SetText(string.format("%s%s %s%d|r%s",
-            L.STRIKE_PREFIX, L.STRIKE_SEP, StreakColor(t.streak), t.streak, mark))
+        row.mark:SetText(mark)
 
         if DB.opts.showRate then
-            row.rate:SetText(string.format("|cff909090proc|r %s", FormatPct(t.procs, t.casts)))
+            row.rateLabel:SetText("|cff909090proc|r")
+            row.rate:SetText(FormatPct(t.procs, t.casts))
+            row.rateLabel:Show()
             row.rate:Show()
         else
+            row.rateLabel:Hide()
             row.rate:Hide()
         end
     end
@@ -740,7 +758,7 @@ end
 
 -- Show one stage on screen at the size it would really be, for a few seconds.
 local function PreviewTier(kind, i, seconds)
-    seconds = seconds or PREVIEW_HOLD
+    seconds = seconds or PREVIEW.hold
     previewKind, previewTier, previewUntil = kind, i, GetTime() + seconds
     UpdateShameAll()
     if C_Timer and C_Timer.After then
@@ -804,6 +822,7 @@ local function RowTooltip(row)
 end
 
 local ShowOptions   -- defined with the options panel below
+local ShowSetup     -- the first-run walkthrough, defined further down
 
 -- exposed so the settings panel and the test harness can force a redraw
 UpdateDisplayPublic = UpdateDisplay
@@ -831,11 +850,66 @@ local function SetFontSize(fontString, size)
     if path then pcall(fontString.SetFont, fontString, path, size, flags) end
 end
 
+-- The third row is drawn for the Prismatic Bolt tally, for the RESET button, or
+-- for both. The button keeps its own line rather than moving in with a
+-- neighbour: switching the tally off should not shuffle the rest of the window.
 local function ActiveRows()
     local list = { rows[1], rows[2] }
-    if DB.opts.showPB then table.insert(list, rows[3]) end
+    if DB.opts.showPB or DB.opts.showPBReset then table.insert(list, rows[3]) end
     return list
 end
+
+local ROW_TEXTS = { "label", "value", "mark", "rateLabel", "rate" }
+
+-- Set true whenever a column had to be guessed at instead of measured, which
+-- happens on the very first layout: the font is not resolved yet, so
+-- GetStringWidth answers 0. Guessing too narrow is what made the first-ever
+-- frame wrap "STRIKE:" onto two lines and print the raw colour codes, so the
+-- layout is simply run again a moment later, once the client can measure.
+-- guessed  a column had to be estimated, so come back and measure properly
+-- retries  how many times that has been tried, so it cannot loop for ever
+-- cache    widths per font size: measured once and then remembered, because
+--          re-measuring every layout is what gave a wrong answer room to
+--          compound - a column that was right at this size is still right
+local layoutState = { guessed = false, retries = 0, cache = {} }
+
+-- Roughly how wide this many characters will be at this font size. Deliberately
+-- an over-estimate: a column slightly too wide looks like a column, a column
+-- slightly too narrow looks like a bug.
+local function GuessWidth(chars, size)
+    return math.ceil(chars * size * 0.62) + 4
+end
+
+-- How wide is this string in the font the row is actually using?
+--
+-- Two things have to be undone before asking, and forgetting them is what made
+-- the labels creep inwards until they read "STRI...". A FontString that already
+-- has an explicit width answers with that width, so measuring a column, setting
+-- it, and measuring again next time feeds on itself and shrinks a little every
+-- pass. And the size must be applied first, or the answer describes whatever
+-- font the row happened to be using before.
+local function MeasureText(fs, sample, chars, size)
+    local fallback = GuessWidth(chars, size)
+    if not (fs and fs.SetText and fs.GetStringWidth) then
+        layoutState.guessed = true
+        return fallback
+    end
+
+    local keep = fs.GetText and fs:GetText() or nil
+    local ok, w = pcall(function()
+        SetFontSize(fs, size)
+        if fs.SetWidth then fs:SetWidth(0) end   -- 0 = size to the text
+        fs:SetText(sample)
+        return fs:GetStringWidth()
+    end)
+    if keep ~= nil then pcall(fs.SetText, fs, keep) end
+
+    if ok and type(w) == "number" and w > 1 then return math.ceil(w) + 6 end
+    layoutState.guessed = true
+    return fallback
+end
+
+
 
 local function ApplyLayout()
     if not frame or not rows then return end
@@ -857,38 +931,96 @@ local function ApplyLayout()
 
     -- hide everything first, then lay out only the rows that are switched on
     for _, row in ipairs(rows) do
-        row.icon:Hide(); row.main:Hide(); row.hover:Hide()
-        if row.rate then row.rate:Hide() end
+        row.icon:Hide(); row.hover:Hide()
+        for _, key in ipairs(ROW_TEXTS) do
+            if row[key] then row[key]:Hide() end
+        end
         if row.reset then row.reset:Hide() end
     end
 
+    local ts = DB.ui.textSize
     local active = ActiveRows()
-    for i, row in ipairs(active) do
-        local y = -(top + (i - 1) * rowH)
 
-        row.icon:Show(); row.main:Show(); row.hover:Show()
+    -- One set of column widths for every row, measured from the font so the
+    -- columns are as tight as they can be without the contents ever moving.
+    local cols = layoutState.cache[ts]
+    if not cols then
+        layoutState.guessed = false
+        local first = active[1]
+        cols = {
+            label = first and MeasureText(first.label, "STRIKE:", 7, ts) or 0,
+            value = first and MeasureText(first.value, "888",     3, ts) or 0,
+            mark  = first and MeasureText(first.mark,  "?",       1, ts) or 0,
+            proc = 0, pct = 0,
+        }
+        for _, row in ipairs(active) do
+            if row.rate then
+                cols.proc = MeasureText(row.rateLabel, "proc",   4, ts - 1)
+                cols.pct  = MeasureText(row.rate,      "100.0%", 6, ts - 1)
+                break
+            end
+        end
+        -- Only a set of widths the client could actually measure is worth
+        -- keeping; an estimate is replaced when the retry below measures again.
+        if not layoutState.guessed then layoutState.cache[ts] = cols end
+    end
+    local labelW, valueW, markW = cols.label, cols.value, cols.mark
+    local procW, pctW = cols.proc, cols.pct
+
+
+    for i, row in ipairs(active) do
+        local y   = -(top + (i - 1) * rowH)
+        local mid = y - icon / 2            -- the row's vertical centre line
+        local textX = pad + 2 + icon + 7
+
+        -- The row can be present purely to hold the button.
+        local counted = not (row.kind == "pb" and not DB.opts.showPB)
+
+        row.hover:Show()
+        if counted then row.icon:Show() else row.icon:Hide() end
         row.icon:SetSize(icon, icon)
         row.icon:ClearAllPoints()
         row.icon:SetPoint("TOPLEFT", frame, "TOPLEFT", pad + 2, y)
 
-        SetFontSize(row.main, DB.ui.textSize)
-
-        row.main:ClearAllPoints()
-        row.main:SetPoint("LEFT", row.icon, "RIGHT", 7, 0)
-
-        if row.rate then
-            SetFontSize(row.rate, DB.ui.textSize - 1)
-            row.rate:ClearAllPoints()
-            row.rate:SetPoint("RIGHT", frame, "RIGHT", -(pad + 3), 0)
-            row.rate:SetPoint("TOP", row.icon, "TOP", 0, -math.floor(icon / 2 - DB.ui.textSize / 2) - 1)
+        -- Each column is anchored to the frame, never to the text beside it, so
+        -- nothing can be pushed along by a neighbour growing a digit.
+        local columns = {
+            { row.label, textX,                        labelW },
+            { row.value, textX + labelW + 5,           valueW },
+            { row.mark,  textX + labelW + 5 + valueW,  markW  },
+        }
+        for _, col in ipairs(columns) do
+            local fs, x, w = col[1], col[2], col[3]
+            SetFontSize(fs, ts)
+            fs:SetWidth(w)
+            fs:SetJustifyH("LEFT")
+            -- One line, always. A wrapped label is what turned "STRIKE:" into
+            -- two rows with the raw colour escape showing on the second.
+            if fs.SetWordWrap then fs:SetWordWrap(false) end
+            fs:ClearAllPoints()
+            fs:SetPoint("LEFT", frame, "TOPLEFT", x, mid)
+            if counted then fs:Show() else fs:Hide() end
         end
 
-        if row.reset then
+        if row.rate then
+            for _, col in ipairs({ { row.rateLabel, pad + 3 + pctW + 4, procW },
+                                   { row.rate,      pad + 3,            pctW  } }) do
+                local fs, inset, w = col[1], col[2], col[3]
+                SetFontSize(fs, ts - 1)
+                fs:SetWidth(w)
+                fs:SetJustifyH("RIGHT")
+                if fs.SetWordWrap then fs:SetWordWrap(false) end
+                fs:ClearAllPoints()
+                fs:SetPoint("RIGHT", frame, "TOPRIGHT", -inset, mid)
+            end
+        end
+
+        if row.reset and DB.opts.showPBReset then
             row.reset:SetFrameLevel(row.hover:GetFrameLevel() + 5)
             row.reset:ClearAllPoints()
-            row.reset:SetPoint("RIGHT", frame, "RIGHT", -(pad + 2), 0)
-            row.reset:SetPoint("TOP", row.icon, "TOP", 0, -math.floor(icon / 2 - 8))
+            row.reset:SetPoint("RIGHT", frame, "TOPRIGHT", -(pad + 2), mid)
             row.reset:SetSize(48, 18)
+            row.reset:Show()
         end
 
         row.hover:ClearAllPoints()
@@ -908,6 +1040,17 @@ local function ApplyLayout()
     else
         frame:SetBackdropBorderColor(0, 0, 0, 0)
     end
+
+    -- At login the font is not resolved yet and every column had to be guessed.
+    -- Come back in a moment and measure properly, so the first frame the player
+    -- ever sees settles into the right shape by itself.
+    if layoutState.guessed and layoutState.retries < 20 and C_Timer and C_Timer.After then
+        layoutState.retries = layoutState.retries + 1
+        C_Timer.After(0.2, function()
+            ApplyLayoutPublic()
+            UpdateDisplay()
+        end)
+    end
 end
 
 ApplyLayoutPublic = ApplyLayout
@@ -919,11 +1062,12 @@ local function BuildRow(parent, kind, spellID, label, tip)
     row.icon:SetTexture(SpellTexture(spellID))
     row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-    row.main = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    row.main:SetJustifyH("LEFT")
-
-    row.rate = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    row.rate:SetJustifyH("RIGHT")
+    -- Five fixed columns rather than one string: see ApplyLayout.
+    row.label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    row.value = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    row.mark  = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    row.rateLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    row.rate      = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 
     -- One hit area covering exactly this row, so the tooltip has a sane anchor.
     -- It also has to forward dragging, otherwise the rows would swallow it and
@@ -953,8 +1097,9 @@ local function BuildPBRow(parent)
                         or "Interface\\Icons\\Spell_Arcane_Blast")
     row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-    row.main = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    row.main:SetJustifyH("LEFT")
+    row.label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    row.value = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    row.mark  = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 
     row.reset = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
     row.reset:SetText("RESET")
@@ -1039,12 +1184,21 @@ end
 ----------------------------------------------------------------------
 local options
 
+-- Columns sit 220 px apart, so anything sitting in one gets a little less than
+-- that to draw in and cannot spill into its neighbour.
+local COLUMN_TEXT_W = 200
+
 local function MakeCheck(parent, label, tooltip, x, y, get, set)
     local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
     cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
     cb:SetSize(24, 24)
     local text = cb:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     text:SetPoint("LEFT", cb, "RIGHT", 2, 1)
+    -- Bounded to the column, so a long label wraps or trims instead of running
+    -- underneath whatever is in the next one.
+    text:SetWidth(COLUMN_TEXT_W)
+    text:SetJustifyH("LEFT")
+    text:SetWordWrap(false)
     text:SetText(label)
     cb.refresh = function() cb:SetChecked(get() and true or false) end
     cb:SetScript("OnClick", function(self)
@@ -1073,7 +1227,10 @@ local function MakeSlider(parent, label, x, y, minV, maxV, step, get, set, fmt)
     sl:SetValueStep(step)
     sl:SetObeyStepOnDrag(true)
     local caption = sl:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    caption:SetPoint("BOTTOMLEFT", sl, "TOPLEFT", 0, 2)
+    caption:SetPoint("BOTTOMLEFT", sl, "TOPLEFT", 0, 5)
+    caption:SetWidth(COLUMN_TEXT_W)
+    caption:SetJustifyH("LEFT")
+    caption:SetWordWrap(false)
     sl.caption = caption
     local captionFmt = fmt or (label .. ": %d")
     sl.refresh = function()
@@ -1286,7 +1443,7 @@ end
 
 local function CreateOptions()
     options = CreateFrame("Frame", "ArcaneDespairTrackerOptions", UIParent, "BackdropTemplate")
-    options:SetSize(740, 846)
+    options:SetSize(790, 812)
     options:SetPoint("CENTER")
     options:SetClampedToScreen(true)
     options:SetMovable(true)
@@ -1300,7 +1457,9 @@ local function CreateOptions()
         edgeFile = "Interface\\Buttons\\WHITE8X8",
         edgeSize = 1,
     })
-    options:SetBackdropColor(0.04, 0.03, 0.06, 0.95)
+    -- Solid. A settings panel you can read the dungeon through is a settings
+    -- panel you cannot read.
+    options:SetBackdropColor(0.045, 0.04, 0.065, 1)
     options:SetBackdropBorderColor(0.53, 0.47, 1, 0.9)
     options:Hide()
 
@@ -1309,8 +1468,24 @@ local function CreateOptions()
     if screen and screen < 860 then options:SetScale(0.78) end
 
     local title = options:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    title:SetPoint("TOP", options, "TOP", 0, -12)
+    title:SetPoint("TOP", options, "TOP", 0, -13)
     title:SetText("|cff9d8cffArcane Despair Tracker|r")
+
+    local titleRule = options:CreateTexture(nil, "ARTWORK")
+    titleRule:SetTexture("Interface\\Buttons\\WHITE8X8")
+    titleRule:SetColorTexture(0.53, 0.47, 1, 0.35)
+    titleRule:SetPoint("TOPLEFT", options, "TOPLEFT", 12, -36)
+    titleRule:SetPoint("TOPRIGHT", options, "TOPRIGHT", -12, -36)
+    titleRule:SetHeight(1)
+
+    -- Escape closes it, like every other panel in the game.
+    if type(UISpecialFrames) == "table" then
+        local listed = false
+        for _, name in ipairs(UISpecialFrames) do
+            if name == "ArcaneDespairTrackerOptions" then listed = true break end
+        end
+        if not listed then table.insert(UISpecialFrames, "ArcaneDespairTrackerOptions") end
+    end
 
     local close = CreateFrame("Button", nil, options, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", options, "TOPRIGHT", -4, -4)
@@ -1319,13 +1494,21 @@ local function CreateOptions()
     local widgets = {}
     local function add(w) table.insert(widgets, w) return w end
 
+    -- A heading with a rule under it. Without the rule the three columns read as
+    -- one long list of controls and the sections stop being sections.
     local function header(text, x, y)
         local fs = options:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         fs:SetPoint("TOPLEFT", options, "TOPLEFT", x, y)
         fs:SetText("|cffffd100" .. text .. "|r")
+
+        local rule = options:CreateTexture(nil, "ARTWORK")
+        rule:SetColorTexture(1, 0.82, 0, 0.22)
+        rule:SetPoint("TOPLEFT", options, "TOPLEFT", x, y - 15)
+        rule:SetWidth(COLUMN_TEXT_W + 14)
+        rule:SetHeight(1)
     end
 
-    local L1, L2, L3 = 16, 226, 440      -- three columns
+    local L1, L2, L3 = 16, 246, 476      -- three columns
 
     ------------------------------------------------ left: display
     header("Display", L1, -42)
@@ -1378,96 +1561,117 @@ local function CreateOptions()
     ------------------------------------------------ left: counting
     header("Counting", L1, -504)
     add(MakeCheck(options, "Pause Blast when procs hidden",
-        "Blizzard hides your buffs in combat. When a Clearcasting cannot be seen, the Arcane Blast cast is "
-        .. "not counted at all instead of being guessed at - the '?' means counting is paused. "
-        .. "Arcane Barrage always counts.", L1, -524,
+        "Midnight hides your buffs in combat. ADT reads them through Blizzard's Cooldown Manager "
+        .. "instead - that needs the Cooldown Manager switched on with Clearcasting on a tracked bar "
+        .. "(Edit Mode -> Cooldown Manager). If no signal is available at all, an ambiguous Arcane "
+        .. "Blast is not counted rather than guessed at, and '?' says so. Arcane Barrage always counts.",
+        L1, -524,
         function() return DB.opts.pauseWhenBlind end, function(v) DB.opts.pauseWhenBlind = v end))
-    add(MakeCheck(options, "Prismatic Bolt counts as Blast", nil, L1, -548,
+    add(MakeCheck(options, "Any proc resets the strike",
+        "On: the strike answers 'how long since this proc last showed up', so a Clearcasting off an "
+        .. "Arcane Explosion or Orb clears it too - which is what the faces really react to. "
+        .. "Off: only a proc the counted spell itself earned clears it, the strict reading of "
+        .. "'Arcane Blasts that did not proc Clearcasting'. Either way the totals and the proc rate "
+        .. "only ever count procs an actual Blast or Barrage earned.", L1, -548,
+        function() return DB.opts.anyProcResets end, function(v) DB.opts.anyProcResets = v end))
+    add(MakeCheck(options, "Prismatic Bolt counts as Blast", nil, L1, -572,
         function() return DB.opts.countPrismatic end, function(v) DB.opts.countPrismatic = v end))
-    add(MakeCheck(options, "Fight summary in chat", nil, L1, -572,
+    add(MakeCheck(options, "Fight summary in chat", nil, L1, -596,
         function() return DB.opts.reportCombat end, function(v) DB.opts.reportCombat = v end))
     add(MakeCheck(options, "Reset everything each fight",
         "Every counter starts from zero when a new fight begins - both strikes, the totals, "
         .. "the proc rates and the Prismatic Bolt tally. Turn it off to keep running totals "
-        .. "across a whole session.", L1, -596,
+        .. "across a whole session.", L1, -620,
         function() return DB.opts.resetOnFight end, function(v) DB.opts.resetOnFight = v end))
     add(MakeCheck(options, "Skip Barrages in Arcane Soul",
-        "Skips only the 4s Arcane Soul window itself. The 17.4s wait between casting Arcane "
-        .. "Surge and Soul landing is ordinary play and keeps counting. Those casts can still "
-        .. "proc - Arcane Salvo keeps building to 25 either way - so this is a matter of "
-        .. "taste, not accuracy, and it is off by default.", L1, -620,
+        "On by default. Skips only the 4s Arcane Soul window itself, casts and procs alike - "
+        .. "the 17.4s wait between casting Arcane Surge and Soul landing is ordinary play and "
+        .. "keeps counting. Turn it off to have the burst window judged like any other casts.",
+        L1, -644,
         function() return DB.opts.soulPause end, function(v) DB.opts.soulPause = v end))
-    add(MakeSlider(options, "Soul lands after", L1, -664, 0, 30, 0.1,
+    add(MakeSlider(options, "Soul lands after", L1, -688, 0, 30, 0.1,
         function() return DB.opts.soulDelay end,
         function(v) DB.opts.soulDelay = v end,
         "Wait after Surge: %.1fs"))
-    add(MakeSlider(options, "Soul lasts", L1, -704, 1, 15, 0.5,
+    add(MakeSlider(options, "Soul lasts", L1, -728, 1, 15, 0.5,
         function() return DB.opts.soulDuration end,
         function(v) DB.opts.soulDuration = v end,
         "Skipped window: %.1fs"))
-    add(MakeSlider(options, "Alert at strike", L1, -744, 0, 30, 1,
+    add(MakeSlider(options, "Alert at strike", L1, -768, 0, 30, 1,
         function() return DB.opts.alertThreshold end,
         function(v) DB.opts.alertThreshold = v end,
         "Alert at strike: %d  (0 = off)"))
 
-    add(MakeButton(options, "Reset statistics", L1, -772, 130, function()
-        if ResetStatsPublic then ResetStatsPublic() end
-    end))
-    add(MakeButton(options, "Diagnostics", L1, -798, 130, function()
-        if ShowStatusPublic then ShowStatusPublic() end
-    end))
-    add(MakeButton(options, "Fight history", L1 + 138, -772, 130, function()
-        if ShowHistoryPublic then ShowHistoryPublic() end
-    end))
 
     ------------------------------------------------ right: faces, per counter
     local shameKind = "blast"
     local function kindOf() return shameKind end
 
-    header("Faces", L2, -42)
-    local kindBtn = add(MakeButton(options, "", L2, -62, 196, function()
-        shameKind = (shameKind == "blast") and "barrage" or "blast"
-        if options.refresh then options.refresh() end
-    end))
-    kindBtn.refresh = function()
-        kindBtn:SetText("Editing: " .. KIND_LABEL[shameKind])
-    end
-    kindBtn:SetScript("OnEnter", function(self)
-        if not GameTooltip then return end
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Which counter these settings apply to")
-        GameTooltip:AddLine("Arcane Blast and Arcane Barrage each have their own faces, "
-            .. "thresholds, sizes, sounds and screen position. Click to switch.",
-            0.8, 0.8, 0.8, true)
-        GameTooltip:Show()
-    end)
-    kindBtn:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+    -- The two counters keep entirely separate faces, thresholds, sizes, sounds
+    -- and screen positions, so this whole column belongs to one of them at a
+    -- time. A single "Editing: ..." button hid that: it read as a label, and
+    -- there was nothing to say the other half existed. Two buttons, the active
+    -- one lit, plus a line saying what they do.
+    header("Faces and sounds", L2, -42)
+    local kindNote = options:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    kindNote:SetPoint("TOPLEFT", options, "TOPLEFT", L2, -64)
+    kindNote:SetWidth(COLUMN_TEXT_W + 14)
+    kindNote:SetJustifyH("LEFT")
+    if kindNote.SetWordWrap then kindNote:SetWordWrap(false) end
+    kindNote:SetText("These settings edit:")
 
-    add(MakeCheck(options, "Enable the faces", nil, L2, -88,
+    local kindBtns = {}
+    -- 108 + 108 + a hair of gap fits the column, and "Arcane Barrage" fits 108.
+    for i, entry in ipairs({ { "blast", 0 }, { "barrage", 110 } }) do
+        local kind, dx = entry[1], entry[2]
+        local btn = add(MakeButton(options, KIND_LABEL[kind], L2 + dx, -80, 108, function()
+            shameKind = kind
+            if options.refresh then options.refresh() end
+        end))
+        btn:SetScript("OnEnter", function(self)
+            if not GameTooltip then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine("Edit the " .. KIND_LABEL[kind] .. " face")
+            GameTooltip:AddLine("Each counter has its own faces, thresholds, sizes, sounds "
+                .. "and place on screen. Switching here changes which one the rest of this "
+                .. "column is editing - it does not turn anything on or off.",
+                0.8, 0.8, 0.8, true)
+            GameTooltip:Show()
+        end)
+        btn:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+        btn.refresh = function()
+            local on = (shameKind == kind)
+            btn:SetText(on and ("|cffffd100" .. KIND_LABEL[kind] .. "|r") or KIND_LABEL[kind])
+            if btn.SetAlpha then btn:SetAlpha(on and 1.0 or 0.55) end
+        end
+        kindBtns[i] = btn
+    end
+
+    add(MakeCheck(options, "Enable the faces", nil, L2, -104,
         function() return Shame(kindOf()).enabled end,
         function(v) Shame(kindOf()).enabled = v; UpdateShameAll() end))
-    add(MakeSlider(options, "Appears at strike", L2, -132, 2, 40, 1,
+    add(MakeSlider(options, "Appears at strike", L2, -148, 2, 40, 1,
         function() return Shame(kindOf()).at end,
         function(v) Shame(kindOf()).at = v; UpdateShameAll() end,
         "Appears at strike: %d"))
-    add(MakeSlider(options, "Despair step", L2, -172, 1, 10, 1,
+    add(MakeSlider(options, "Despair step", L2, -188, 1, 10, 1,
         function() return Shame(kindOf()).step end,
         function(v) Shame(kindOf()).step = v; UpdateShameAll() end,
         "Next face every %d casts"))
-    add(MakeSlider(options, "Base size", L2, -212, 24, 200, 4,
+    add(MakeSlider(options, "Base size", L2, -228, 24, 200, 4,
         function() return Shame(kindOf()).size end,
         function(v) Shame(kindOf()).size = v; UpdateShameAll() end,
         "Base size: %d px"))
-    add(MakeSlider(options, "Growth per cast", L2, -252, 0, 40, 1,
+    add(MakeSlider(options, "Growth per cast", L2, -268, 0, 40, 1,
         function() return Shame(kindOf()).growth end,
         function(v) Shame(kindOf()).growth = v; UpdateShameAll() end,
         "Growth per cast: %d px"))
-    add(MakeSlider(options, "Hide after", L2, -292, 0, 30, 1,
+    add(MakeSlider(options, "Hide after", L2, -308, 0, 30, 1,
         function() return Shame(kindOf()).timeout end,
         function(v) Shame(kindOf()).timeout = v; UpdateShameAll() end,
         "Hide %d s after the last cast"))
 
-    local placeBtn = add(MakeButton(options, "", L2, -316, 110, function()
+    local placeBtn = add(MakeButton(options, "", L2, -332, 110, function()
         placingKind = (placingKind == kindOf()) and nil or kindOf()
         UpdateShameAll()
         if options.refresh then options.refresh() end
@@ -1475,7 +1679,7 @@ local function CreateOptions()
     placeBtn.refresh = function()
         placeBtn:SetText(placingKind == kindOf() and "Done placing" or "Place face")
     end
-    add(MakeButton(options, "Re-centre", L2 + 116, -316, 84, function()
+    add(MakeButton(options, "Re-centre", L2 + 116, -332, 84, function()
         local cfg = Shame(kindOf())
         cfg.point, cfg.x, cfg.y = "CENTER", 0, 0
         local f = shameFrames[kindOf()]
@@ -1486,20 +1690,20 @@ local function CreateOptions()
     end))
 
     ------------------------------------------------ right: sound
-    header("Sound", L2, -352)
-    add(MakeCheck(options, "Play a sound", nil, L2, -372,
+    header("Sound", L2, -368)
+    add(MakeCheck(options, "Play a sound", nil, L2, -388,
         function() return Shame(kindOf()).soundEnabled end,
         function(v) Shame(kindOf()).soundEnabled = v end))
-    add(MakeSlider(options, "Sound every N casts", L2, -416, 1, 10, 1,
+    add(MakeSlider(options, "Sound every N casts", L2, -432, 1, 10, 1,
         function() return Shame(kindOf()).every end,
         function(v) Shame(kindOf()).every = v end,
         "Sound every %d casts"))
-    add(MakeSlider(options, "At the last stage", L2, -456, 1, 10, 1,
+    add(MakeSlider(options, "At the last stage", L2, -472, 1, 10, 1,
         function() return Shame(kindOf()).everyFinal end,
         function(v) Shame(kindOf()).everyFinal = v end,
         "At the last stage: every %d"))
 
-    local channelBtn = add(MakeButton(options, "", L2, -480, 130, function()
+    local channelBtn = add(MakeButton(options, "", L2, -496, 130, function()
         local idx = 1
         for n, name in ipairs(SOUND_CHANNELS) do
             if name == DB.opts.soundChannel then idx = n break end
@@ -1521,9 +1725,29 @@ local function CreateOptions()
     end)
     channelBtn:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
 
-    add(MakeButton(options, "Test", L2 + 136, -480, 64, function()
+    add(MakeButton(options, "Test", L2 + 136, -496, 64, function()
         PlayShameSound(kindOf(), 1)
     end))
+
+    -- Both of these apply to either counter, so they sit outside the per-counter
+    -- block above. They are separate because they want different answers: a
+    -- delayed face means watching the previous stage sit on screen and then swap,
+    -- while a delayed sound is simply one that a proc gets to cancel.
+    header("Grace after a cast", L2, -532)
+    add(MakeSlider(options, "Face delay", L2, -572, 0, 2, 0.05,
+        function() return DB.opts.faceDelay end,
+        function(v) DB.opts.faceDelay = v; UpdateShameAll() end,
+        "Face delay: %.2fs  (0 = instant)"))
+    add(MakeSlider(options, "Sound delay", L2, -612, 0, 2, 0.05,
+        function() return DB.opts.soundDelay end,
+        function(v) DB.opts.soundDelay = v end,
+        "Sound delay: %.2fs"))
+    local graceNote = options:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    graceNote:SetPoint("TOPLEFT", options, "TOPLEFT", L2, -640)
+    graceNote:SetWidth(COLUMN_TEXT_W + 14)
+    graceNote:SetJustifyH("LEFT")
+    graceNote:SetText("A proc landing inside the window cancels whatever is still waiting. "
+        .. "A delayed face just looks broken, so leave it at 0.")
 
     ------------------------------------------------ far right: stage preview
     local stagesHeader = options:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -1543,8 +1767,8 @@ local function CreateOptions()
         local kind = kindOf()
         for i = 1, #TIERS[kind] do
             local stage = i
-            C_Timer.After((stage - 1) * PREVIEW_STEP, function()
-                PreviewTier(kind, stage, PREVIEW_HOLD)
+            C_Timer.After((stage - 1) * PREVIEW.step, function()
+                PreviewTier(kind, stage, PREVIEW.hold)
                 if Shame(kind).soundEnabled then PlayShameSound(kind, stage) end
             end)
         end
@@ -1555,7 +1779,10 @@ local function CreateOptions()
     add(MakeCheck(options, "Show the cast counter", "A third row tallying Prismatic Bolts cast this fight.", L3, -344,
         function() return DB.opts.showPB end,
         function(v) DB.opts.showPB = v; ApplyLayout(); UpdateDisplay() end))
-    add(MakeCheck(options, "Show its RESET button", nil, L3, -368,
+    add(MakeCheck(options, "Show its RESET button",
+        "Clears every counter, not just the Prismatic Bolt tally. With the row above "
+        .. "switched off the button moves to the last row that is showing, so it is "
+        .. "still there.", L3, -368,
         function() return DB.opts.showPBReset end,
         function(v) DB.opts.showPBReset = v; ApplyLayout(); UpdateDisplay() end))
     ------------------------------------------------ far right: colours
@@ -1569,10 +1796,36 @@ local function CreateOptions()
         { "Window title",        "title" },
     }
     for i, entry in ipairs(swatches) do
-        add(MakeColorSwatch(options, entry[1], L3, -422 - (i - 1) * 22, entry[2]))
+        add(MakeColorSwatch(options, entry[1], L3, -426 - (i - 1) * 22, entry[2]))
     end
 
-    options:SetHeight(846)
+    ------------------------------------------------ far right: tools
+    -- These lived at the bottom of the first column, which made it run a head
+    -- taller than the other two for no reason.
+    header("Tools", L3, -566)
+    add(MakeButton(options, "Run setup again", L3, -590, 130, function()
+        options:Hide()
+        if ShowSetup then ShowSetup() end
+    end))
+    add(MakeButton(options, "Reset statistics", L3, -616, 130, function()
+        if ResetStatsPublic then ResetStatsPublic() end
+    end))
+    add(MakeButton(options, "Fight history", L3, -642, 130, function()
+        if ShowHistoryPublic then ShowHistoryPublic() end
+    end))
+    add(MakeButton(options, "Diagnostics", L3, -668, 130, function()
+        if ShowStatusPublic then ShowStatusPublic() end
+    end))
+    add(MakeCheck(options, "Debug logging",
+        "Prints every cast and every proc decision to chat, including which detector "
+        .. "made the call. Useful once, noisy forever - leave it off.", L3, -696,
+        function() return DB.opts.debug end, function(v) DB.opts.debug = v end))
+
+    local credits = options:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    credits:SetPoint("BOTTOM", options, "BOTTOM", 0, 8)
+    credits:SetText("Author: iamRudy  |cff5a5a66-|r  big thanks to Viktor")
+
+    options:SetHeight(812)
 
     options.refresh = function()
         for _, w in ipairs(widgets) do
@@ -1716,13 +1969,386 @@ ShowOptions = function()
         local ok, err = pcall(CreateOptions)
         if not ok or not options then
             Print("could not build the settings panel: %s", tostring(err))
-            Print("all settings are still available as commands - see |cffffff00/adt help|r")
+            Print("the counter itself is unaffected - see |cffffff00/adt help|r for what can "
+                .. "still be done from chat")
             options = nil
             return
         end
     end
     options.refresh()
     if options:IsShown() then options:Hide() else options:Show() end
+end
+
+----------------------------------------------------------------------
+-- First-run walkthrough
+--
+-- Six short steps. The parts worth spending someone's attention on are what the
+-- numbers in the window actually mean, the three choices that change how casts
+-- are counted, and putting the three movable pieces where they belong - that
+-- last one otherwise means finding three different buttons in the settings.
+--
+-- It waits for Arcane and for combat to end before appearing: teaching someone
+-- to read a window they cannot see is pointless, and asking them to drag things
+-- around mid-pull is worse.
+----------------------------------------------------------------------
+-- One table rather than two locals: this file is close to Lua's ceiling of 200
+-- of them in a chunk, and a walkthrough is not worth spending two on.
+local setupUI = {}
+
+setupUI.build = function()
+    local setup = CreateFrame("Frame", "ArcaneDespairTrackerSetup", UIParent, "BackdropTemplate")
+    setup:SetSize(540, 450)
+    setup:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
+    setup:SetFrameStrata("DIALOG")
+    setup:SetClampedToScreen(true)
+    setup:SetMovable(true)
+    setup:EnableMouse(true)
+    setup:RegisterForDrag("LeftButton")
+    setup:SetScript("OnDragStart", setup.StartMoving)
+    setup:SetScript("OnDragStop", setup.StopMovingOrSizing)
+    setup:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1,
+    })
+    setup:SetBackdropColor(0.045, 0.04, 0.065, 1)
+    setup:SetBackdropBorderColor(0.53, 0.47, 1, 0.9)
+    setup:Hide()
+
+    -- The addon's own name on every step, not just the first: a window that says
+    -- only "Faces and sounds" gives no clue what is talking to you.
+    local brand = setup:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    brand:SetPoint("TOP", setup, "TOP", 0, -12)
+    brand:SetText("|cff9d8cffArcane Despair Tracker|r")
+
+    local title = setup:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", setup, "TOP", 0, -36)
+
+    local counter = setup:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    counter:SetPoint("TOPRIGHT", setup, "TOPRIGHT", -16, -16)
+
+    local rule = setup:CreateTexture(nil, "ARTWORK")
+    rule:SetColorTexture(0.53, 0.47, 1, 0.35)
+    rule:SetPoint("TOPLEFT", setup, "TOPLEFT", 14, -56)
+    rule:SetPoint("TOPRIGHT", setup, "TOPRIGHT", -14, -56)
+    rule:SetHeight(1)
+
+    local body = setup:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    body:SetPoint("TOPLEFT", setup, "TOPLEFT", 20, -68)
+    body:SetWidth(500)
+    body:SetJustifyH("LEFT")
+    body:SetJustifyV("TOP")
+
+    -- Controls are rebuilt for each step and parked off to the side otherwise;
+    -- creating frames once and reusing them keeps this from leaking widgets.
+    setup.parts = {}
+    local function part(key, builder)
+        if not setup.parts[key] then setup.parts[key] = builder() end
+        return setup.parts[key]
+    end
+
+    local back = CreateFrame("Button", nil, setup, "UIPanelButtonTemplate")
+    back:SetSize(90, 24)
+    back:SetPoint("BOTTOMLEFT", setup, "BOTTOMLEFT", 16, 14)
+    back:SetText("Back")
+
+    local next = CreateFrame("Button", nil, setup, "UIPanelButtonTemplate")
+    next:SetSize(110, 24)
+    next:SetPoint("BOTTOMRIGHT", setup, "BOTTOMRIGHT", -16, 14)
+
+    local skip = CreateFrame("Button", nil, setup, "UIPanelButtonTemplate")
+    skip:SetSize(90, 24)
+    skip:SetPoint("BOTTOM", setup, "BOTTOM", 0, 14)
+    skip:SetText("Skip")
+
+    -- One question, two answers, the recommended one marked. Two buttons read
+    -- better than a checkbox here: the recommendation is visible without having
+    -- to work out which way round the tick means.
+    local function choice(key, y, question, left, right, get, set)
+        local block = part(key, function()
+            local q = setup:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            q:SetPoint("TOPLEFT", setup, "TOPLEFT", 20, y)
+            -- Wide and tall enough for the longest label; the first pass at this
+            -- had the recommendation running off the end of its own button.
+            local a = CreateFrame("Button", nil, setup, "UIPanelButtonTemplate")
+            a:SetSize(245, 26)
+            a:SetPoint("TOPLEFT", setup, "TOPLEFT", 20, y - 18)
+            local b = CreateFrame("Button", nil, setup, "UIPanelButtonTemplate")
+            b:SetSize(245, 26)
+            b:SetPoint("TOPLEFT", setup, "TOPLEFT", 275, y - 18)
+            -- A question is three widgets, so it carries the same Show and Hide
+            -- the single-widget parts have and the step switcher stays simple.
+            local blk = { q = q, a = a, b = b }
+            function blk:Show() self.q:Show() self.a:Show() self.b:Show() end
+            function blk:Hide() self.q:Hide() self.a:Hide() self.b:Hide() end
+            return blk
+        end)
+
+        block.q:SetText(question)
+        local function paint()
+            local on = get()
+            block.a:SetText(on and ("|cffffd100" .. left .. "|r") or left)
+            block.b:SetText((not on) and ("|cffffd100" .. right .. "|r") or right)
+            if block.a.SetAlpha then block.a:SetAlpha(on and 1 or 0.55) end
+            if block.b.SetAlpha then block.b:SetAlpha(on and 0.55 or 1) end
+        end
+        block.a:SetScript("OnClick", function() set(true); paint() end)
+        block.b:SetScript("OnClick", function() set(false); paint() end)
+        paint()
+        block:Show()
+        return block
+    end
+
+    local function toggle(key, y, label, get, set)
+        local cb = part(key, function()
+            local c = CreateFrame("CheckButton", nil, setup, "UICheckButtonTemplate")
+            c:SetSize(24, 24)
+            c:SetPoint("TOPLEFT", setup, "TOPLEFT", 20, y)
+            c.text = c:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+            c.text:SetPoint("LEFT", c, "RIGHT", 2, 1)
+            return c
+        end)
+        cb.text:SetText(label)
+        cb:SetChecked(get() and true or false)
+        cb:SetScript("OnClick", function(self) set(self:GetChecked() and true or false) end)
+        cb:Show()
+        return cb
+    end
+
+    local function button(key, x, y, w, label, onClick)
+        local b = part(key, function()
+            local btn = CreateFrame("Button", nil, setup, "UIPanelButtonTemplate")
+            btn:SetPoint("TOPLEFT", setup, "TOPLEFT", x, y)
+            return btn
+        end)
+        b:SetSize(w, 26)
+        b:SetText(label)
+        b:SetScript("OnClick", onClick)
+        b:Show()
+        return b
+    end
+
+    -- Runs one counter's whole escalation past you, faces and sound together, so
+    -- "test the strike" means the same thing here as it will in a real pull.
+    local function runStrikeDemo(kind)
+        for i = 1, #TIERS[kind] do
+            C_Timer.After((i - 1) * PREVIEW.step, function()
+                PreviewTier(kind, i, PREVIEW.hold)
+                if Shame(kind).soundEnabled then PlayShameSound(kind, i) end
+            end)
+        end
+    end
+
+    local steps = {
+        {
+            title = "Welcome",
+            bodyH = 320,
+            text = "Thanks for downloading. This counts the |cffffd100Arcane Blasts|r that "
+                .. "did not proc Clearcasting and the |cffffd100Arcane Barrages|r that did "
+                .. "not proc Prismatic Bolt, and keeps score of the dry run.\n\n"
+                .. "|cffff8040One thing it needs first.|r Midnight hides your own buffs from "
+                .. "addons in combat, so the addon reads them through Blizzard's "
+                .. "|cffffd100Cooldown Manager|r. Switch it on and put |cffffd100Clearcasting|r "
+                .. "and |cffffd100Prismatic Bolt|r on a tracked buff bar - without that, "
+                .. "procs land where the addon cannot see them.\n\n"
+                .. "It will not make the procs come. It will keep an exact and unflattering "
+                .. "record of how long they have not.\n\n"
+                .. "A short setup follows - four steps, and you can skip it at any point.",
+            build = function()
+                DB.ui.shown = true
+                UpdateDisplay()
+            end,
+        },
+        {
+            title = "How you want it counted",
+            bodyH = 90,
+            text = "Your counter is on screen now. |cffffd100STRIKE|r is casts in a row with "
+                .. "no proc, |cffffd100proc %|r your real rate since the last reset, "
+                .. "|cffffd100?|r means that proc cannot be seen right now so the cast is "
+                .. "left out rather than guessed at, and |cffffd100CASTS|r counts the "
+                .. "Prismatic Bolts you cast. Hover a row for more, right-click it for the "
+                .. "settings.\n\nFour choices decide what the numbers mean:",
+            build = function()
+                choice("c1", -160, "Counters each fight, or running totals?",
+                    "Each fight (recommended)", "Keep running",
+                    function() return DB.opts.resetOnFight end,
+                    function(v) DB.opts.resetOnFight = v end)
+                choice("c2", -220, "What clears the strike?",
+                    "Only its own proc (recommended)", "Any proc at all",
+                    function() return not DB.opts.anyProcResets end,
+                    function(v) DB.opts.anyProcResets = not v end)
+                choice("c3", -280, "Casts the addon cannot judge?",
+                    "Leave them out (recommended)", "Count them anyway",
+                    function() return DB.opts.pauseWhenBlind end,
+                    function(v) DB.opts.pauseWhenBlind = v end)
+                choice("c4", -340, "Barrages cast during Arcane Soul?",
+                    "Skip them (recommended)", "Count them too",
+                    function() return DB.opts.soulPause end,
+                    function(v) DB.opts.soulPause = v end)
+            end,
+        },
+        {
+            title = "Faces, sounds and where they sit",
+            bodyH = 84,
+            text = "As a strike grows, a face appears and gets worse, with a sound to match "
+                .. "and a separate set per counter. Try one, then drag the counter window "
+                .. "and the two faces wherever you want them - the faces are at their "
+                .. "starting size and grow with the strike, so leave them room.",
+            build = function()
+                DB.ui.shown, DB.ui.locked = true, false
+                placingKind = "all"
+                UpdateDisplay()
+                UpdateShameAll()
+                toggle("t1", -160, "Show the faces", function()
+                    return DB.shame.blast.enabled
+                end, function(v)
+                    DB.shame.blast.enabled, DB.shame.barrage.enabled = v, v
+                    UpdateShameAll()
+                end)
+                toggle("t2", -188, "Play the sounds", function()
+                    return DB.shame.blast.soundEnabled
+                end, function(v)
+                    DB.shame.blast.soundEnabled, DB.shame.barrage.soundEnabled = v, v
+                end)
+                button("b1", 20, -224, 245, "Test Arcane Blast strike", function()
+                    runStrikeDemo("blast")
+                end)
+                button("b2", 275, -224, 245, "Test Arcane Barrage strike", function()
+                    runStrikeDemo("barrage")
+                end)
+                button("b3", 20, -258, 245, "Centre everything", function()
+                    DB.ui.point, DB.ui.x, DB.ui.y = "CENTER", 0, 180
+                    if frame then
+                        frame:ClearAllPoints()
+                        frame:SetPoint("CENTER", UIParent, "CENTER", 0, 180)
+                    end
+                    for _, kind in ipairs(SHAME_KINDS) do
+                        local cfg = Shame(kind)
+                        cfg.point, cfg.x, cfg.y = "CENTER", 0, 0
+                        local f = shameFrames[kind]
+                        if f then
+                            f:ClearAllPoints()
+                            f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+                        end
+                    end
+                end)
+            end,
+            leave = function()
+                placingKind = nil
+                UpdateShameAll()
+            end,
+        },
+        {
+            title = "That is everything",
+            text = "|cffffd100/adt|r opens the settings, and there is a great deal more in "
+                .. "there: every colour, the size of everything, per-stage sounds, a log of "
+                .. "your last twenty fights.\n\n"
+                .. "|cffffd100/adt setup|r runs this walkthrough again.\n"
+                .. "|cffffd100/adt help|r lists the rest.\n\n"
+                .. "That is the lot. Have fun out there - and may your strike stay short.",
+        },
+    }
+
+    local at = 1
+
+    local function show(step)
+        for _, w in pairs(setup.parts) do w:Hide() end
+        local s = steps[at]
+        if s and s.leave and step ~= at then s.leave() end
+        at = math.max(1, math.min(#steps, step))
+        s = steps[at]
+
+        title:SetText("|cffffd100" .. s.title .. "|r")
+        counter:SetText(string.format("Step %d of %d", at, #steps))
+        body:SetText(s.text)
+        body:SetHeight(s.bodyH or (s.build and 120 or 320))
+        if s.build then s.build() end
+
+        back:SetShown(at > 1)
+        skip:SetShown(at < #steps)
+        next:SetText(at == #steps and "Finish" or "Next")
+    end
+
+    -- Saved the moment the walkthrough is done with, and saved in the character's
+    -- SavedVariables, which an addon update does not touch. The version stamp is
+    -- what a later release would read if it ever wanted to show something new;
+    -- the flag alone is enough to keep this one from coming back.
+    local function markDone()
+        DB.opts.onboarded = true
+        -- Read from the .toc rather than written out here, so the two cannot
+        -- drift apart. No file-level local for it: this chunk is at Lua's
+        -- ceiling of 200 of them and a version string is not worth one.
+        local meta = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
+        if meta then
+            local ok, v = pcall(meta, ADDON_NAME, "Version")
+            if ok and type(v) == "string" and v ~= "" then
+                DB.opts.onboardedVersion = v
+            end
+        end
+    end
+
+    local function finish()
+        local s = steps[at]
+        if s and s.leave then s.leave() end
+        markDone()
+        setup:Hide()
+        ApplyLayout()
+        UpdateDisplay()
+    end
+
+    back:SetScript("OnClick", function() show(at - 1) end)
+    skip:SetScript("OnClick", finish)
+    next:SetScript("OnClick", function()
+        if at == #steps then finish() else show(at + 1) end
+    end)
+    -- Closing the window by any other route - Escape, /reload, the pull starting -
+    -- still counts as having seen it, except when combat took it away, which is
+    -- the one case that gets it back. Otherwise it reappears every login.
+    setup:SetScript("OnHide", function()
+        local s = steps[at]
+        if s and s.leave then s.leave() end
+        if not setupUI.interrupted then markDone() end
+    end)
+
+    -- Escape closes it too, and closing it counts as done (see OnHide above).
+    if type(UISpecialFrames) == "table" then
+        local listed = false
+        for _, name in ipairs(UISpecialFrames) do
+            if name == "ArcaneDespairTrackerSetup" then listed = true break end
+        end
+        if not listed then table.insert(UISpecialFrames, "ArcaneDespairTrackerSetup") end
+    end
+
+    setup.start = function() show(1) setup:Show() end
+    setupUI.frame = setup
+end
+
+-- Shown once, and only when it can actually be followed.
+function MaybeShowSetup()
+    if not DB or DB.opts.onboarded then return end
+    if DB.opts.onlyArcane and CurrentSpecID() ~= ARCANE_SPEC_ID then return end
+    if UnitAffectingCombat and UnitAffectingCombat("player") then return end
+    if setupUI.frame and setupUI.frame:IsShown() then return end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(2, function()
+            if DB.opts.onboarded then return end
+            if UnitAffectingCombat and UnitAffectingCombat("player") then return end
+            ShowSetup()
+        end)
+    else
+        ShowSetup()
+    end
+end
+
+ShowSetup = function()
+    if not setupUI.frame then
+        local ok, err = pcall(setupUI.build)
+        if not ok or not setupUI.frame then
+            Print("could not build the walkthrough: %s", tostring(err))
+            setupUI.frame = nil
+            return
+        end
+    end
+    setupUI.frame.start()
 end
 
 ----------------------------------------------------------------------
@@ -1748,6 +2374,45 @@ local function ShameCheck(kind, streak)
     if shameLastKey[kind] == key then return end
     shameLastKey[kind] = key
     PlayShameSound(kind, tier)
+end
+
+-- Cast events and proc signals do not arrive in a fixed order, and a proc can
+-- take a moment to become visible at all. Reacting to a dry cast the instant it
+-- lands is what makes a face flash up on a Blast that actually procced.
+--
+-- The face and the sound want different answers to that, which is why they have
+-- separate delays. A delayed face is worse than no delay at all: the frame keeps
+-- drawing the previous stage until the timer expires, so you watch the old
+-- picture sit there and then swap - the face is best left instant. The sound is
+-- the one that benefits, because an escalating honk over a proc is the thing
+-- that actually grates.
+--
+-- Either way a proc inside the window cancels what is pending: ResetShame bumps
+-- shameRun, and these checks refuse to fire for a run already superseded.
+local function ShameLater(kind, run, streak)
+    local function stillCurrent()
+        if (shameRun[kind] or 0) ~= run then return false end   -- a proc got there first
+        return DB.total[kind].streak == streak                  -- the strike moved on
+    end
+
+    local function after(delay, fn)
+        if (delay or 0) <= 0 or not (C_Timer and C_Timer.After) then
+            fn()
+        else
+            C_Timer.After(delay, fn)
+        end
+    end
+
+    after(DB.opts.faceDelay, function()
+        if not stillCurrent() then return end
+        shameOk[kind] = streak
+        if UpdateShamePublic then UpdateShamePublic() end
+    end)
+
+    after(DB.opts.soundDelay, function()
+        if not stillCurrent() then return end
+        ShameCheck(kind, streak)
+    end)
 end
 
 local function FireAlert(kind, streak)
@@ -1793,6 +2458,7 @@ end
 local function ResetShame(kind)
     shameRun[kind] = (shameRun[kind] or 0) + 1   -- a new run may sound the same strike again
     shameLastKey[kind] = nil
+    shameOk[kind] = 0                            -- cancels anything still in its grace period
     if UpdateShamePublic then UpdateShamePublic() end
 end
 
@@ -1839,7 +2505,7 @@ local function RegisterCast(kind, procced)
         Debug("cast booked as PROC: %s", kind)
     else
         FireAlert(kind, DB.total[kind].streak)
-        ShameCheck(kind, DB.total[kind].streak)
+        ShameLater(kind, shameRun[kind] or 0, DB.total[kind].streak)
         Debug("cast booked as dry: %s (streak %d)", kind, DB.total[kind].streak)
 
         -- This cast now owns the claim on the next proc we see. No timer: the
@@ -1848,6 +2514,22 @@ local function RegisterCast(kind, procced)
         -- that are still unambiguously this cast's.
         pendingCast = { kind = kind }
     end
+end
+
+-- A proc landed, but no cast of ours owns it - it came off an Arcane Explosion,
+-- an Orb, a Barrage, or it was recovered after the fact from a consumption.
+--
+-- With "any proc resets the strike" on, the number on screen answers "how long
+-- since this proc last showed up", which is what the escalating faces are really
+-- reacting to. The totals stay honest either way: with no owner there is nothing
+-- to reclassify, so no dry cast is ever turned into a proc here.
+local function ResetStreakForAnyGain(kind, source)
+    if not DB.opts.anyProcResets then return end
+    for _, t in ipairs(Trackers(kind)) do t.streak = 0 end
+    maxSnapshot[kind] = nil
+    ResetShame(kind)
+    Debug("%s strike reset by a proc it did not earn (via %s)", kind, source or "?")
+    UpdateDisplay()
 end
 
 -- Arcane Soul is optional to exclude, not a correctness fix: Arcane Salvo keeps
@@ -1899,18 +2581,45 @@ local function BookCast(kind)
 end
 
 -- A proc was observed directly: aura gained/stacked, or Arcane Blast overridden.
-local function OnProcObserved(kind, source, skipDedupe)
+local function OnProcObserved(kind, source, skipDedupe, settled)
     local now = GetTime()
+
+    -- If the Barrages inside Arcane Soul are not being counted, the Bolts they
+    -- proc cannot be counted either. Crediting them meant the proc rate rose off
+    -- casts that were never in the denominator, and worse, the retro-conversion
+    -- below would reach back and turn the last Barrage before the window into a
+    -- proc it never earned.
+    if kind == "barrage" and SoulActive() then
+        Debug("barrage proc ignored (via %s): Arcane Soul is up and its casts are not counted",
+            source or "?")
+        return false
+    end
 
     -- Several signals describe the same proc (aura gain, usability flip, button
     -- override). Whichever arrives first wins; the rest are the same event.
     -- skipDedupe is for a genuine multi-stack gain seen in one poll.
     if not skipDedupe and (now - (lastGain[kind] or 0)) < SAME_INSTANT then
         Debug("duplicate %s proc signal ignored (via %s)", kind, source or "?")
-        return
+        return false
     end
 
     lastGain[kind] = now
+
+    -- A proc just landed and we do not know which aura instance it is, because
+    -- spending the last one destroyed that knowledge and the replacement came in
+    -- with its spell id sealed. If exactly one unlabelled aura turned up in the
+    -- same moment, it is this one. Doing it here rather than inside any single
+    -- detector means whichever of them saw the proc can relearn the instance -
+    -- otherwise casting Prismatic Bolt left the instance detector blind for the
+    -- rest of the pull, and only a plain Arcane Barrage rotation kept working.
+    if knownInstance[kind] == nil and anonymousAdds
+       and #anonymousAdds.ids == 1 and now - anonymousAdds.at < ANON_ADD_TTL then
+        knownInstance[kind] = anonymousAdds.ids[1]
+        anonymousAdds = nil
+        Debug("%s aura instance relearned as %s (via %s)",
+            kind, tostring(knownInstance[kind]), source or "?")
+    end
+
     PruneCredits(kind)
     table.insert(credits[kind], now)
     while #credits[kind] > MAX_GAIN do table.remove(credits[kind], 1) end
@@ -1919,82 +2628,16 @@ local function OnProcObserved(kind, source, skipDedupe)
         pendingCast = nil
         ConvertLastDryToProc(kind, source)
     else
-        -- No cast of ours is waiting on a proc. Either the cast event has not
-        -- reached us yet (carry it forward), or this proc came from some other
-        -- spell - a Barrage, a Prismatic Bolt, anything. In that case it is
-        -- deliberately ignored: the counter is "Arcane Blasts that did not proc",
-        -- so a proc no Arcane Blast earned must not clear the streak.
-        carry[kind] = now
+        -- No tracked cast owns this proc. A signal that may still be waiting for
+        -- its cast event is carried forward briefly; a settled one (the Cooldown
+        -- Manager path already waited a frame for casts) is not.
+        if not settled then carry[kind] = now end
+        ResetStreakForAnyGain(kind, source)
         Debug("proc observed with no pending %s cast (via %s) - not attributed", kind, source or "?")
     end
+    return true
 end
 
--- Can we still see procs the moment they land? If yes, a consumption tells us
--- nothing new and must never be used to attribute a proc to a cast.
--- Can we see a proc land *in the situation we are in right now*? Probed fresh,
--- never cached, because this changes the moment you pull a boss.
---
--- The subtlety that matters: the usability and override detectors only reveal a
--- proc arriving from nothing. Once you already hold a Clearcasting stack,
--- Arcane Missiles is already castable, so a second stack flips nothing. Treating
--- those detectors as "live" unconditionally is what stopped procs from counting
--- when a stack was already up - the consumption fallback was suppressed for a
--- proc that nothing else could ever have seen.
-DetectionLive = function(kind)
-    if kind == "blast" then
-        -- reading the aura is the only way to see a stack go 1 -> 2
-        if not AllAuraIDsSecret(CC_AURA_IDS) then return true end
-        -- aura is secret: usability covers 0 -> 1 only
-        return missilesUsable == false
-    end
-
-    if not AllAuraIDsSecret(PB_AURA_IDS) then return true end
-    BlastOverride()                     -- refreshes overrideReadable
-    return overrideReadable and lastOverride == nil
-end
-
--- A cast that is only possible because a proc existed. Last-resort evidence,
--- used only while every live detector is blind.
-local function OnProcConsumed(kind, source)
-    PruneCredits(kind)
-    local list = credits[kind]
-    if #list > 0 then
-        table.remove(list, 1)          -- already counted, do not count it twice
-        Debug("consumed a proc that was already counted: %s", kind)
-        return
-    end
-
-    if DetectionLive(kind) then
-        -- We were watching and saw no proc land on one of our casts, so this proc
-        -- belonged to something else. Guessing here is what used to reset the
-        -- streak for procs Arcane Blast never earned.
-        Debug("consumed an unseen %s proc, but detection is live - not attributed", kind)
-        return
-    end
-
-    if kind == "blast" and DB.opts.pauseWhenBlind then
-        -- Blast casts made while blind were never counted, so there is nothing
-        -- to convert and nothing to guess about.
-        Debug("consumed an unseen %s proc while blind, but counting was paused", kind)
-        return
-    end
-
-    -- Blind. The proc is real but we never saw it land, so the best available
-    -- evidence is which of our tracked spells was cast last. If that was not the
-    -- spell this counter is about, stay out of it.
-    if lastBookedKind ~= kind then
-        Debug("consumed an unseen %s proc while blind, but the last tracked cast was %s - not attributed",
-            kind, tostring(lastBookedKind))
-        return
-    end
-
-    Debug("consumed an unseen %s proc while blind (via %s) - attributing it", kind, source or "?")
-    ConvertLastDryToProc(kind, source)
-end
-
-----------------------------------------------------------------------
--- Aura / override polling
-----------------------------------------------------------------------
 -- The same proc can live under more than one spell id: Blizzard's Cooldown
 -- Manager tracks Clearcasting as 79684 while the player buff answers to 263725.
 -- Try them all and take the first that actually reads. "restricted" beats
@@ -2009,29 +2652,715 @@ local function ReadAuraAny(ids)
     return nil, restricted and "restricted" or "absent", nil
 end
 
+----------------------------------------------------------------------
+-- Cooldown Manager proc detector
+--
+-- Stack digits and timestamps are secret in combat, but Blizzard's own Cooldown
+-- Manager still has to redraw when your proc changes, and it does that from
+-- untainted code. Changes to an aura instance it already tracks run through the
+-- item's OnUnitAuraUpdatedEvent; the 0 <-> up transition runs through
+-- OnActiveStateChanged. Hooking those tells us a proc landed without ever
+-- looking at a value we are not allowed to read - including the case nothing
+-- else can see, a proc landing on top of a stack you are already holding.
+--
+-- The callback is deferred one frame. By then UNIT_SPELLCAST_SUCCEEDED has run,
+-- so a pending Arcane Blast marks a gain, and a fresh Arcane Missiles marks a
+-- consumption. Direction without a stack count.
+--
+-- IN-GAME REQUIREMENT: the player must have Blizzard's Cooldown Manager enabled
+-- with the proc on one of its bars (Edit Mode -> Cooldown Manager -> Tracked
+-- Buffs). If it is off, nothing here can be hooked and the addon falls back to
+-- the weaker signals - which is why every use of this is gated on `proven`.
+----------------------------------------------------------------------
+-- Names taken from a live client by hooking every method on the item and seeing
+-- which ones fire. These say "the tracked aura was just applied" outright, with
+-- no reading of any value and no inferring from a redraw:
+--   OnUnitAuraAddedEvent   the game telling the item its aura appeared
+--   TriggerAuraAppliedAlert what plays the Cooldown Manager's buff-gain sound
+--   OnAuraInstanceInfoSet  the item being handed the new aura instance
+-- Arcane Barrage only, per the rule that a working counter is left alone.
+local VIEWER_AURA_METHODS = {
+    -- fired for any change to the tracked aura, both counters
+    change = { "OnUnitAuraUpdatedEvent", "OnActiveStateChanged" },
+    -- "it was applied", said outright. Exactly one method survives here, and the
+    -- two that did not are worth naming:
+    --   OnAuraInstanceInfoSet   part of the item's ordinary refresh sweep,
+    --                           alongside RefreshData and RefreshAuraInstance
+    --   OnUnitAuraAddedEvent    named for the event it handles, not for what it
+    --                           found: a live log had it firing twice per aura
+    --                           update, continuously, while the same Bolt was
+    --                           held throughout and no alert ever fired
+    -- Both cleared the strike on Barrages that had procced nothing. A method
+    -- name is not a promise about what causes the call.
+    gain = { "TriggerAuraAppliedAlert" },
+    gone = { "TriggerAuraRemovedAlert", "OnAuraInstanceInfoCleared" },
+}
+local VIEWER_RESCAN  = 5.0   -- items are rebuilt on talent and Edit Mode changes
+
+local function ViewerAuraIDs(kind)
+    return (kind == "blast") and CC_AURA_IDS or PB_AURA_IDS
+end
+
+-- Which spell ids might the Cooldown Manager have filed this proc under? Buff
+-- ids only. Casting ids are deliberately excluded: Prismatic Bolt's cast id
+-- belongs to an ability entry, and searching for it is how the detector ended
+-- up hooked to the Arcane Blast button instead of the Prismatic Bolt! buff.
+local function ViewerLookupIDs(kind)
+    -- A copy: the lookup below learns new ids into the very list it is handed,
+    -- and growing a table while iterating it is nobody's idea of clear code.
+    local out = {}
+    for _, id in ipairs(ViewerAuraIDs(kind)) do out[#out + 1] = id end
+    return out
+end
+
+-- true = the proc is up, false = it is gone, nil = we cannot tell.
+-- nil is the important one: if the whole bar is hidden, every item on it is
+-- hidden too, and reading that as "no proc" would be worse than saying so.
+local function ViewerActive(v)
+    if not (v and v.item) then return nil end
+
+    -- First: the Cooldown Manager's own record of whether the tracked aura is
+    -- up. It comes from C_CooldownViewer rather than from a frame, so it answers
+    -- even when the item neither hides nor calls anything - the state a live log
+    -- left the Prismatic Bolt item in. Arcane Barrage only: the Clearcasting
+    -- side reports through its callbacks already, and a working counter is not
+    -- somewhere to go changing what "the proc is up" means.
+    if v.kind == "barrage" and v.cooldownID
+       and C_CooldownViewer and C_CooldownViewer.GetCooldownViewerCooldownInfo then
+        local okInfo, has = pcall(function()
+            local info = C_CooldownViewer.GetCooldownViewerCooldownInfo(v.cooldownID)
+            -- Written out, because "cond and info.hasAura or nil" turns a
+            -- perfectly good false into nil - and false, "the proc is gone", is
+            -- the answer this whole function exists to be able to give.
+            if type(info) ~= "table" then return nil end
+            return info.hasAura
+        end)
+        if okInfo and has ~= nil and not IsSecret(has) then
+            return has and true or false
+        end
+    end
+
+    local ok, shown = pcall(function()
+        if v.owner and v.owner.IsShown and not v.owner:IsShown() then return nil end
+        if v.item.IsActive then return v.item:IsActive() end
+        if v.item.IsShown then return v.item:IsShown() end
+        return nil
+    end)
+    if not ok or shown == nil or IsSecret(shown) then return nil end
+    return shown and true or false
+end
+
+-- Is this detector something we may actually rely on? Installed hooks are not
+-- enough - Blizzard has to have called one - and the item has to still be
+-- readable, so switching the Cooldown Manager off mid-session hands the work
+-- back to the fallbacks instead of going quietly blind.
+local function ViewerLive(kind)
+    local v = viewer[kind]
+    if not (v and v.hooked and v.proven) then return false end
+    if v.trusted == false then return false end
+    return ViewerActive(v) ~= nil
+end
+
+-- Could the aura itself show a re-proc? Only if it stacks, or carries a
+-- duration that would move. Prismatic Bolt! does neither: one application, and
+-- a fresh one on top of it leaves the same instance with the same everything.
+-- For a buff like that the Cooldown Manager redraw is the only evidence there
+-- is, so a readable aura must not be allowed to veto it.
+local function AuraCanShowRefresh(state)
+    if not state then return false end
+    if (state.stacks or 1) > 1 then return true end
+    return (state.expires or 0) > 0
+end
+
+local function ObserveViewerProc(kind, source)
+    -- Where the aura can express the change, let it own the decision, so a late
+    -- redraw cannot count the same proc twice.
+    local state, status = ReadAuraAny(ViewerAuraIDs(kind))
+    if status == "ok" and AuraCanShowRefresh(state) then
+        Debug("%s signal ignored: the aura can show this itself (%s)", kind, source or "?")
+        return false
+    end
+    return OnProcObserved(kind, source, false, true)
+end
+
+-- Spending the proc redraws and re-fires everything too. That is only what
+-- happened if the spending cast is still the most recent thing we saw: a cast
+-- made after it re-opens the window for a genuine new proc.
+local function JustSpent(kind)
+    local spent = lastConsumedAt[kind] or 0
+    return GetTime() - spent < BACK_WINDOW and spent >= (lastCastAt[kind] or 0)
+end
+
+local function QueueViewerSignal(kind, item, source, fromHook, isGain)
+    local v = viewer[kind]
+    if not v or item ~= v.item or v.queued then return end
+    v.queued = true
+
+    -- For Arcane Blast, only Blizzard calling one of our hooks counts as proof:
+    -- watching the item can never see a second Clearcasting stack land on the
+    -- first, so it must not be allowed to retire the fallbacks or clear the
+    -- "counting is paused" mark on a counter that abstains for exactly that
+    -- reason. Prismatic Bolt does not stack, so for Barrage seeing the item
+    -- appear and disappear IS the whole question - and gating it on a callback
+    -- that never comes is what took away its "the proc is gone" substitute.
+    if (fromHook or kind == "barrage") and not v.proven then
+        v.proven = true
+        Debug("%s Cooldown Manager detector proven live (%s)", kind, tostring(v.ownerName))
+    end
+
+    local function settle()
+        v.queued = false
+        if item ~= v.item then return end
+        v.active = ViewerActive(v)
+
+        -- These two fire on every redraw, so they only speak up when the reason
+        -- changes. Otherwise a busy pull buries everything else in the log.
+        local function skip(why)
+            if v.lastSkip ~= why then
+                v.lastSkip = why
+                Debug("%s viewer change ignored: %s", kind, why)
+            end
+        end
+
+        -- A signal that says "applied" outright needs none of the reasoning
+        -- below: it is not a redraw to be interpreted, it is the game naming the
+        -- event. It also must not be vetoed by the item's own active state,
+        -- which on this client is exactly the thing that cannot be trusted.
+        if isGain then
+            v.wasActive, v.lastSkip = true, nil
+            -- Guard against the item reporting an aura it already had, at login
+            -- or on entering the world, when no cast of ours could have earned it.
+            if GetTime() - lastAnyCast > USABLE_GATE then
+                return skip("an aura was applied, but no cast of ours preceded it")
+            end
+            return ObserveViewerProc(kind, source)
+        end
+
+        -- Went from up to gone: that is the proc being spent or expiring.
+        if v.active == false then
+            v.wasActive = false
+            return skip("the proc went away, it did not land")
+        end
+
+        -- Came back from nothing. Spending cannot make a proc appear, so this is
+        -- a new one however recently the old one was used. This is the fast
+        -- Prismatic Bolt -> Arcane Barrage case: the Bolt is spent and a fresh
+        -- one lands inside the same breath, and a plain "was it just spent?"
+        -- timer threw it away whenever the earning cast had yet to be reported.
+        local reappeared = (v.wasActive == false)
+        v.wasActive = true
+
+        if not reappeared and JustSpent(kind) then
+            return skip("the proc was just spent")
+        end
+        v.lastSkip = nil
+
+        ObserveViewerProc(kind, source)
+    end
+
+    if C_Timer and C_Timer.After then C_Timer.After(0, settle) else settle() end
+end
+
+-- Forward declaration: the hooks below fire long after this file has loaded,
+-- but they must close over the real local, not a global that never existed.
+local NoteViewerActive
+
+local function HookViewerItem(kind, item, state)
+    local function hookMethod(owner, method, flag, handler)
+        if state[flag] then return end
+        local exists = false
+        pcall(function() exists = type(owner[method]) == "function" end)
+        if not exists then return end
+        local ok = pcall(hooksecurefunc, owner, method, handler)
+        if ok then state[flag] = true end
+    end
+
+    for _, method in ipairs(VIEWER_AURA_METHODS.change) do
+        -- Not logged here. These fire several times per aura update, and what
+        -- came of one is logged where the decision is made, with the method
+        -- named in the source. Whether Blizzard calls them at all is what
+        -- /adt status answers.
+        hookMethod(item, method, method, function()
+            QueueViewerSignal(kind, item, "cooldown-viewer", true)
+        end)
+    end
+
+    -- The cooldown swipe is deliberately NOT hooked. It restarts for reasons
+    -- that have nothing to do with a proc landing, and a live log showed it
+    -- firing during a Prismatic Bolt into Arcane Barrage sequence and being
+    -- reported against Clearcasting. A buff being reapplied with nothing visible
+    -- changing is the aura-instance detector's job, and it does it without
+    -- guessing at what a redraw meant.
+
+    -- The proc dropping off is not a proc, but it does retire any credit still
+    -- waiting to be spent, and it is what makes the next arrival an arrival.
+    local function markGone(changed)
+        local v = viewer[kind]
+        if changed ~= nil and changed ~= v.item then return end
+        v.wasActive = false
+        -- The item's own answer is taken only when it agrees that the proc is
+        -- gone. Forcing it to false instead would be undone by the next poll on
+        -- an item that always reports itself shown, and a false that flips back
+        -- to true is indistinguishable from an arrival.
+        if ViewerActive(v) == false then v.active = false end
+        ExpireCredits(kind, function() return ViewerActive(viewer[kind]) ~= true end)
+    end
+
+    hookMethod(item, "OnUnitAuraRemovedEvent", "OnUnitAuraRemovedEvent", markGone)
+
+    -- The methods the game calls to say the aura was applied or removed, rather
+    -- than to redraw something. Arcane Barrage only: the Clearcasting counter
+    -- reports correctly through the change callbacks above and is left alone.
+    if kind == "barrage" then
+        for _, method in ipairs(VIEWER_AURA_METHODS.gain) do
+            hookMethod(item, method, method, function()
+                viewer[kind].alertSeen = true
+                QueueViewerSignal(kind, item, "cooldown-viewer:" .. method, true, true)
+            end)
+        end
+        for _, method in ipairs(VIEWER_AURA_METHODS.gone) do
+            hookMethod(item, method, method, markGone)
+        end
+    end
+
+    if not state.scripts and item.HookScript then
+        local ok = pcall(function()
+            -- The item becoming visible IS the proc arriving. Some items are
+            -- shown without OnActiveStateChanged ever being called, so this is
+            -- not merely a state note.
+            item:HookScript("OnShow", function(shown)
+                if shown ~= viewer[kind].item then return end
+                NoteViewerActive(kind, ViewerActive(viewer[kind]))
+            end)
+            item:HookScript("OnHide", markGone)
+        end)
+        if ok then state.scripts = true end
+    end
+end
+
+-- Record what the item is showing, and treat hidden -> shown as a proc landing.
+--
+-- This is the detector that does not depend on Blizzard calling anything. A live
+-- log had the Clearcasting item reporting through OnActiveStateChanged while the
+-- Prismatic Bolt item, hooked and confirmed on the same bar, stayed silent for
+-- the whole sequence - so waiting to be told was never going to be enough.
+-- Looking is: the item is hidden while the proc is gone and shown while it is
+-- up, and that reads correctly even in the middle of an encounter.
+-- Deliberately Arcane Barrage only. The Clearcasting side already reports
+-- through Blizzard's callbacks on this client and counts correctly, so it gets
+-- no new source of procs: an extra detector on a counter that works can only
+-- introduce double counting, never fix anything. Blast still tracks the item's
+-- visibility here, it just does not treat it as a proc.
+NoteViewerActive = function(kind, active)
+    local v = viewer[kind]
+    local prev = v.active
+    v.active = active
+
+    -- Every change of "is the proc up", logged once per change. This is the line
+    -- that separates "the addon never saw the proc" from "it saw it and did not
+    -- credit it" - two failures that look identical on screen and need
+    -- completely different fixes.
+    if active ~= prev then
+        Debug("%s proc is %s (Cooldown Manager)", kind,
+            active == true and "|cff40ff40UP|r"
+            or active == false and "|cffff8080gone|r" or "unreadable")
+    end
+
+    if active == false then
+        v.wasActive = false
+    elseif active == true and prev == false and v.item and kind == "barrage"
+           and v.trusted ~= false then
+        QueueViewerSignal(kind, v.item, "cooldown-viewer-poll")
+    end
+end
+
+local function EnsureViewerHook(kind)
+    local v, now = viewer[kind], GetTime()
+
+    -- This runs four times a second, so the full lookup is rate limited and the
+    -- common path is one cheap look at what the item is currently showing.
+    if now < (v.checkedAt or 0) + VIEWER_RESCAN then
+        if v.item then NoteViewerActive(kind, ViewerActive(v)) end
+        return v.hooked
+    end
+    v.checkedAt = now
+
+    -- The item is gone: talents changed, or the player pulled the proc off the
+    -- tracked set. Forget everything about it rather than keeping a stale frame
+    -- that would answer questions it can no longer answer.
+    local candidates = ViewerLookupIDs(kind)
+
+    local function forget()
+        if v.item then Debug("%s Cooldown Manager item disappeared", kind) end
+        if not v.missWarned then
+            v.missWarned = true
+            Debug("%s has no Cooldown Manager entry (looked for %s)",
+                kind, table.concat(candidates, ", "))
+        end
+        v.item, v.owner, v.ownerName = nil, nil, nil
+        v.hooked, v.proven, v.announced, v.active = false, false, false, nil
+        for _, spellID in ipairs(candidates) do viewerIDCache[spellID] = nil end
+        return false
+    end
+
+    if not hooksecurefunc then return forget() end
+
+    local cooldownID
+    for _, spellID in ipairs(candidates) do
+        cooldownID = ViewerIDForSpell(spellID, ViewerAuraIDs(kind))
+        if cooldownID then break end
+    end
+    if not cooldownID then return forget() end
+
+    local item, owner, ownerName = ViewerItemFor(cooldownID)
+    if not item then return forget() end
+
+    -- Two counters must never end up on one item. If that happens the lookup has
+    -- gone wrong, and the item's callbacks would all be reported against
+    -- whichever kind hooked it first - which is precisely how a Prismatic Bolt
+    -- redraw turned up in the log as a Clearcasting proc.
+    for otherKind, other in pairs(viewer) do
+        if otherKind ~= kind and other.item == item then
+            Debug("%s Cooldown Manager lookup landed on the %s item - ignoring it",
+                kind, otherKind)
+            return forget()
+        end
+    end
+
+    if item ~= v.item then
+        -- A rebuilt item has none of our hooks and has proven nothing yet.
+        v.item, v.owner, v.ownerName = item, owner, ownerName
+        v.hooked, v.proven, v.announced, v.wasActive = false, false, false, nil
+        v.missWarned, v.trusted, v.disagreed = false, nil, 0
+    end
+    v.cooldownID = cooldownID
+    NoteViewerActive(kind, ViewerActive(v))
+    if v.wasActive == nil and v.active ~= nil then v.wasActive = v.active end
+
+    local state = hookedViewerItems[item]
+    if not state then
+        state = {}
+        hookedViewerItems[item] = state
+    end
+    HookViewerItem(kind, item, state)
+
+    v.hooked = state.OnUnitAuraUpdatedEvent == true and state.OnActiveStateChanged == true
+    if v.hooked and not v.announced then
+        v.announced = true
+        Debug("%s Cooldown Manager item hooked (%s)", kind, tostring(ownerName))
+    end
+    return v.hooked
+end
+
+----------------------------------------------------------------------
+-- Aura-instance detector
+--
+-- This is the Clearcasting rule - "the buff was reapplied, so it procced" -
+-- taken off the aura payload, which is secret, and onto the one part of it that
+-- is not. UNIT_AURA carries an updateInfo table listing the auraInstanceIDs
+-- that were added, updated and removed, and auraInstanceID is flagged
+-- NeverSecret. So even when every value inside the aura is sealed, the game
+-- still tells us "this exact aura instance just changed".
+--
+-- All we need is to know which instance is ours. That is learned whenever the
+-- aura reads normally - out of combat, or any moment secrecy lifts - and from
+-- addedAuras when the spell id on it happens to be readable. Once we have it,
+-- a reapplication of a buff that neither stacks nor carries a timer, which is
+-- exactly Prismatic Bolt!, becomes visible with no Cooldown Manager involved.
+----------------------------------------------------------------------
+local function QueueInstanceSignal(kind, source)
+    if instanceQueued[kind] then return end
+    instanceQueued[kind] = true
+
+    local function settle()
+        instanceQueued[kind] = nil
+        if JustSpent(kind) then
+            Debug("%s aura-instance change ignored: the proc was just spent", kind)
+            return
+        end
+        ObserveViewerProc(kind, source)
+    end
+
+    if C_Timer and C_Timer.After then C_Timer.After(0, settle) else settle() end
+end
+
+-- Reading anything out of a secret payload throws, so every step is wrapped and
+-- an unreadable field simply means this detector says nothing.
+local function SafeField(tbl, key)
+    local ok, value = pcall(function() return tbl[key] end)
+    if not ok or value == nil or IsSecret(value) then return nil end
+    return value
+end
+
+local function InstanceIn(list, wanted)
+    if type(list) ~= "table" then return false end
+    local found = false
+    pcall(function()
+        for _, id in ipairs(list) do
+            if id == wanted then found = true return end
+        end
+    end)
+    return found
+end
+
+local function OnAuraUpdate(updateInfo)
+    if type(updateInfo) ~= "table" then return end
+    -- A full update carries no instance lists; the ordinary poll handles it.
+    if SafeField(updateInfo, "isFullUpdate") == true then return end
+
+    -- New auras sometimes arrive with a readable spell id. That is the cheapest
+    -- chance to learn which instance belongs to which proc.
+    local added = SafeField(updateInfo, "addedAuras")
+    if type(added) == "table" then
+        local anon = {}
+        pcall(function()
+            for _, aura in ipairs(added) do
+                local spellID  = SafeField(aura, "spellId")
+                local instance = SafeField(aura, "auraInstanceID")
+                if instance and not spellID then
+                    -- The instance id is readable but the spell it belongs to is
+                    -- not. Kept for a moment: if a proc is seen to appear right
+                    -- now and this was the only aura added, it must be this one.
+                    anon[#anon + 1] = instance
+                elseif spellID and instance then
+                    for _, kind in ipairs(SHAME_KINDS) do
+                        for _, id in ipairs(ViewerAuraIDs(kind)) do
+                            if id == spellID then
+                                knownInstance[kind] = instance
+                                QueueInstanceSignal(kind, "aura-instance-added")
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+        -- Only ever replaced by a batch that had something in it. An empty
+        -- addedAuras must not wipe this: UNIT_AURA fires constantly in combat
+        -- for every buff and debuff on you, so clearing it here threw away the
+        -- replacement Bolt's identity before anything had a chance to claim it.
+        if #anon > 0 then anonymousAdds = { ids = anon, at = GetTime() } end
+    end
+
+    local updated = SafeField(updateInfo, "updatedAuraInstanceIDs")
+    local removed = SafeField(updateInfo, "removedAuraInstanceIDs")
+
+    -- Same rule as the Cooldown Manager hook: nothing leans on this detector
+    -- until the game has actually handed us one of these lists.
+    if not instanceReadable
+       and (type(updated) == "table" or type(removed) == "table" or type(added) == "table") then
+        instanceReadable = true
+        Debug("aura instance lists are readable - the instance detector is live")
+    end
+
+    for _, kind in ipairs(SHAME_KINDS) do
+        local mine = knownInstance[kind]
+        if mine then
+            if InstanceIn(removed, mine) then
+                knownInstance[kind] = nil
+                ExpireCredits(kind, function() return knownInstance[kind] == nil end)
+                Debug("%s aura instance %s removed", kind, tostring(mine))
+            elseif InstanceIn(updated, mine) then
+                -- The instance we hold was changed in place. For Clearcasting
+                -- that is another stack; for Prismatic Bolt! it is a fresh Bolt
+                -- on top of the one you were saving. Either way: a proc.
+                Debug("%s aura instance %s updated - treating as a proc", kind, tostring(mine))
+                QueueInstanceSignal(kind, "aura-instance-updated")
+            end
+        end
+    end
+end
+
+-- Can we see a proc land *in the situation we are in right now*? Probed fresh,
+-- never cached, because this changes the moment you pull a boss. If we can, a
+-- later consumption tells us nothing new and must not be used to attribute a
+-- proc to a cast.
+--
+-- The subtlety that matters: usability and the button override only reveal a
+-- proc arriving from nothing. Once you already hold the proc, Arcane Missiles is
+-- already castable and Arcane Blast is already overridden, so the next one flips
+-- nothing. Treating those as "live" unconditionally is what stopped procs from
+-- counting while a stack was up. The Cooldown Manager detector is the one that
+-- sees that case, so it is checked in between.
+local function InstanceLive(kind)
+    return instanceReadable and knownInstance[kind] ~= nil
+end
+
+DetectionLive = function(kind)
+    local _, status = ReadAuraAny(ViewerAuraIDs(kind))
+    if status ~= "restricted" then return true end      -- exact stack deltas
+    if ViewerLive(kind) then return true end            -- gains on top of a held proc
+    if InstanceLive(kind) then return true end          -- ... and so does this
+
+    if kind == "blast" then
+        return missilesUsable == false                  -- 0 -> 1 only
+    end
+    BlastOverride()                                     -- refreshes overrideReadable
+    return overrideReadable and lastOverride == nil     -- 0 -> 1 only
+end
+
+-- A cast that is only possible because a proc existed. Last-resort evidence,
+-- used only while every live detector is blind.
+local function OnProcConsumed(kind, source)
+    PruneCredits(kind)
+    local list = credits[kind]
+    if #list > 0 then
+        table.remove(list, 1)          -- already counted, do not count it twice
+        Debug("consumed a proc that was already counted: %s", kind)
+        return
+    end
+
+    -- Spending a proc nothing counted proves one existed - usually gained and
+    -- spent inside the same moment, before any detector could report it. That
+    -- much is certain; which cast earned it is not, so the fallbacks below only
+    -- ever touch the strike unless the evidence is good enough to reclassify.
+    local recovered = (source or "consumed") .. "-recovered"
+
+    if DetectionLive(kind) then
+        Debug("consumed an unseen %s proc while detection is live - strike only", kind)
+        ResetStreakForAnyGain(kind, recovered)
+        return
+    end
+
+    if kind == "blast" and DB.opts.pauseWhenBlind then
+        -- Blast casts made while blind were never counted, so there is nothing
+        -- to convert and nothing to guess about.
+        Debug("consumed an unseen %s proc while blind, but counting was paused", kind)
+        ResetStreakForAnyGain(kind, recovered)
+        return
+    end
+
+    -- Blind. The proc is real but we never saw it land, so the best available
+    -- evidence is which of our tracked spells was cast last. If that was not the
+    -- spell this counter is about, stay out of the totals.
+    if lastBookedKind ~= kind then
+        Debug("consumed an unseen %s proc while blind, but the last tracked cast was %s - strike only",
+            kind, tostring(lastBookedKind))
+        ResetStreakForAnyGain(kind, recovered)
+        return
+    end
+
+    Debug("consumed an unseen %s proc while blind (via %s) - attributing it", kind, source or "?")
+    ConvertLastDryToProc(kind, source)
+end
+
+----------------------------------------------------------------------
+-- Aura / override polling
+----------------------------------------------------------------------
+-- Is this proc up right now according to something that is not the aura API?
+-- Arcane Barrage only, for the same reason as the appearance poll above: the
+-- Clearcasting side reads "restricted" in combat on this client, so it never
+-- reaches the contradiction below, and a counter that works is not somewhere to
+-- go changing what "absent" means.
+local function ProcLooksUp(kind)
+    if kind ~= "barrage" then return false end
+    if viewer[kind].trusted == false then return false end
+    return ViewerActive(viewer[kind]) == true
+end
+
 local function PollAura(key, ids, kind, source)
     local state, status, hitID = ReadAuraAny(ids)
     local via = hitID and ("aura:" .. hitID) or "aura"
 
-    -- The Cooldown Manager draws the stack count, but measuring in a live client
-    -- showed that FontString is itself a Secret Value (item.c3.Applications came
-    -- back <SECRET>). ViewerStacks is kept for /adt probe only - if Blizzard ever
-    -- unseals it, wiring it back in here is a two-line change.
-    if state == nil and status == "restricted"
-       and kind == "blast" and missilesUsable == false then
-        -- nothing readable, but the proc resource is provably gone
-        status, via = "absent", "usable"
+    -- Check the Cooldown Manager entry against the truth whenever the truth is
+    -- available. Measured on a live client: the Prismatic Bolt entry reported
+    -- the proc gone while the aura, readable moments later, had it up the whole
+    -- time - so it is not a detector, it is a machine for producing false
+    -- negatives. Believing one wipes credits, erases the tracked instance and
+    -- convinces the counter it can see, which is worse than having no entry at
+    -- all.
+    --
+    -- Only this direction is judged - the aura holding the proc while the entry
+    -- says gone - and only when it persists, because a single frame of the item
+    -- not having caught up yet is not a lie. Nothing is hard-coded per counter:
+    -- an entry that tells the truth keeps its job.
+    if status == "ok" and state ~= nil then
+        local v = viewer[kind]
+        -- Not "v.item and ViewerActive(v) or nil": that turns the false we are
+        -- looking for into nil, and false is the entire point of this check.
+        local seen
+        if v.item then seen = ViewerActive(v) end
+        if seen == false then
+            v.disagreed = (v.disagreed or 0) + 1
+            if v.disagreed >= 3 and v.trusted ~= false then
+                v.trusted = false
+                Debug("%s Cooldown Manager entry keeps saying the proc is gone while "
+                    .. "the aura is holding it - setting the entry aside", kind)
+            end
+        elseif seen == true then
+            v.disagreed = 0
+            if v.trusted == nil then
+                v.trusted = true
+                Debug("%s Cooldown Manager entry agrees with the aura", kind)
+            end
+        end
+    end
+
+    -- The payload is sealed, but "is it up at all" can still be answered: the
+    -- Cooldown Manager hides the item when the proc is gone, and Arcane Missiles
+    -- stops being castable when Clearcasting is.
+    if state == nil and status == "restricted" then
+        if ViewerLive(kind) and viewer[kind].active == false then
+            status, via = "absent", "cooldown-viewer"
+        elseif kind == "blast" and not ViewerLive(kind) and missilesUsable == false then
+            status, via = "absent", "usable-fallback"
+        end
+    end
+
+    -- The other direction, and the more dangerous one. "Absent" from a
+    -- by-spell-id read looks like a real answer, so the addon happily concludes
+    -- it can see everything - while in fact it is reading nothing at all, every
+    -- cast books as dry and the strike never resets. An independent source
+    -- saying the proc IS up outranks that: Arcane Missiles or Prismatic Bolt
+    -- being castable, or the Cooldown Manager item showing. Treat the read as
+    -- what it is, unreadable, and let the detectors that can see do the work.
+    if status == "absent" and ProcLooksUp(kind) then
+        status, via = "restricted", "contradicted"
     end
 
     auraStatus[kind] = status
 
+    -- Whenever the aura can be read at all, remember which instance is ours.
+    -- That is what lets the instance detector work later, once it cannot. An
+    -- "absent" here includes the substitutes above, and they are trustworthy:
+    -- the Cooldown Manager item is hidden, or Arcane Missiles has stopped being
+    -- castable. Keeping a stale instance would let the detector claim it can
+    -- see a proc that is no longer there to change.
+    if state and state.instance then
+        knownInstance[kind] = state.instance
+    elseif status == "absent" then
+        knownInstance[kind] = nil
+    end
+
     -- Still restricted with no substitute: freeze what we last knew. Erasing it
     -- would make regaining sight at 3 stacks look like three fresh procs.
     if status == "restricted" then
+        auraBlind[key] = true
         if lastAuraSig[key] ~= "restricted" then
             lastAuraSig[key] = "restricted"
-            Debug("%s aura restricted and no substitute source - holding last known state", kind)
+            -- Say why, not just that. "No substitute" has several causes and
+            -- they need completely different fixes; this is the line a live log
+            -- always contains, so it is the one worth making answer the question.
+            local v = viewer[kind]
+            Debug("%s aura restricted, no substitute - viewer: item %s, hooked %s, confirmed %s, "
+                .. "active %s | castable %s",
+                kind, v.item and tostring(v.cooldownID) or "none",
+                tostring(v.hooked), tostring(v.proven), tostring(ViewerActive(v)),
+                tostring(kind == "blast" and missilesUsable or "n/a"))
         end
+        return
+    end
+
+    -- First readable poll after a blind stretch. Whatever is there now may have
+    -- arrived at any point while we could not look, and the detectors that were
+    -- watching have already had their say, so this is a resynchronisation and
+    -- not a proc. Counting it here is how sight returning turns into a phantom.
+    if auraBlind[key] then
+        auraBlind[key] = nil
+        auraState[key] = state and {
+            present = true, instance = state.instance,
+            stacks = state.stacks, expires = state.expires,
+        } or { present = false }
+        Debug("%s aura readable again - resynchronised without counting", kind)
         return
     end
 
@@ -2086,12 +3415,20 @@ end
 
 local function PollOverride()
     local override = BlastOverride()
+    if override ~= lastOverride then
+        Debug("Arcane Blast override %s -> %s",
+            tostring(lastOverride), tostring(override))
+    end
     if override and override ~= lastOverride then
         if not learnedPBCasts[override] then
             learnedPBCasts[override] = true
             DB.learnedPB[tostring(override)] = true
             Debug("learned Prismatic Bolt cast id: %d (%s)", override, SpellName(override))
         end
+        -- The override only ever reveals the Bolt appearing from nothing, which
+        -- the other detectors also see - but it is the one signal that needs no
+        -- Cooldown Manager and no known aura instance, so it is left switched on
+        -- and the duplicate is dropped by the same-instant guard instead.
         if auraStatus.barrage ~= "ok" then
             OnProcObserved("barrage", "override")
         end
@@ -2099,9 +3436,8 @@ local function PollOverride()
     lastOverride = override
 end
 
--- Aura data is a Secret Value during combat, encounters, M+ and rated PvP, so the
--- aura engine can be blind exactly when it matters. Arcane Missiles becoming
--- castable is the same information arriving through a door that stays open.
+-- Arcane Missiles usability: the fallback for clients where the Cooldown Manager
+-- item does not exist or has never actually called one of our hooks.
 local function PollMissilesUsable()
     local usable = ReadUsable(ID.missiles)
     if usable == nil then
@@ -2112,7 +3448,7 @@ local function PollMissilesUsable()
     local prev = missilesUsable
     missilesUsable = usable
 
-    if prev == false and usable == true then
+    if not ViewerLive("blast") and prev == false and usable == true then
         if GetTime() - lastAnyCast <= USABLE_GATE then
             OnProcObserved("blast", "missiles-usable")
         else
@@ -2123,7 +3459,15 @@ local function PollMissilesUsable()
     end
 end
 
+-- Prismatic Bolt's castability was tried as a detector and does not work: a live
+-- client reported it castable while the Cooldown Manager entry for the buff read
+-- active false, moments after the Bolt had been spent. IsSpellUsable answers a
+-- different question than "am I holding one", so nothing may lean on it - and
+-- while it was wired in, it silently cancelled the Barrage substitute below.
+
 local function PollAll()
+    EnsureViewerHook("blast")
+    EnsureViewerHook("barrage")
     PollAura("cc", CC_AURA_IDS, "blast",   "clearcasting-aura")
     PollAura("pb", PB_AURA_IDS, "barrage", "prismatic-aura")
     PollMissilesUsable()
@@ -2149,6 +3493,9 @@ local function OnCast(spellID)
         return
     end
     Debug("cast: %d (%s)", spellID, SpellName(spellID))
+    -- Repeated skip reasons are logged once so a busy pull stays readable, but
+    -- each new cast starts a new situation worth hearing about again.
+    for _, v in pairs(viewer) do v.lastSkip = nil end
 
     if spellID == ID.soulTrigger then
         soulFrom = GetTime() + (DB.opts.soulDelay or 0)
@@ -2163,14 +3510,23 @@ local function OnCast(spellID)
     -- trinkets, potions, racials - leaves the claim standing.
     if CLAIM_BREAKERS[spellID] or learnedPBCasts[spellID] then
         pendingCast = nil
-    else
-        Debug("cast %d cannot proc Clearcasting - claim left standing", spellID)
+    elseif pendingCast then
+        Debug("cast %d cannot proc Clearcasting - %s keeps its claim", spellID, pendingCast.kind)
     end
 
+    -- Spending a proc is also what stops the Cooldown Manager redraw that follows
+    -- from being mistaken for a new one.
     if IsPrismaticCast(spellID) then
         pbCasts = pbCasts + 1
+        lastConsumedAt.barrage = GetTime()
+        -- Prismatic Bolt! does not stack, so casting it always removes the buff.
+        -- Recording that from the cast rather than waiting for the Cooldown
+        -- Manager to admit it means the next Bolt is recognised as a fresh
+        -- arrival even if the item never reported going away.
+        viewer.barrage.wasActive = false
         OnProcConsumed("barrage", "prismatic-bolt-cast")
     elseif spellID == ID.missiles then
+        lastConsumedAt.blast = GetTime()
         OnProcConsumed("blast", "arcane-missiles-cast")
     end
 
@@ -2266,6 +3622,7 @@ local function ResetStats(silent, keepHistory)
     for _, kind in ipairs(SHAME_KINDS) do
         shameRun[kind] = (shameRun[kind] or 0) + 1
         shameLastKey[kind] = nil
+        shameOk[kind] = 0
     end
     pbCasts = 0
     ResetCombatStats()
@@ -2298,175 +3655,187 @@ local function AuraSecrecy(spellID)
         TryCall(C_Secrets.ShouldSpellAuraBeSecret, spellID))
 end
 
+-- One line per counter: which engine is doing the work right now, and whether
+-- the Cooldown Manager detector - the only one that sees a proc landing on a
+-- proc you already hold - is available at all.
+local function DetectorLine(kind, label)
+    local v = viewer[kind]
+    local hook
+    if not v.item then
+        hook = "|cffff8080no Cooldown Manager item|r"
+    elseif not v.hooked then
+        hook = "|cffff8080item found, hooks refused|r"
+    elseif not v.proven then
+        hook = "|cffffcc00hooked, not yet confirmed|r"
+    else
+        hook = string.format("|cff40ff40live|r on %s, proc up: %s",
+            tostring(v.ownerName), tostring(ViewerActive(v)))
+    end
+
+    local v2 = viewer[kind]
+    if v2.item then
+        hook = hook .. string.format(" | cooldownID %s", tostring(v2.cooldownID))
+    end
+
+    local instance
+    if not instanceReadable then
+        instance = "|cffffcc00lists not seen yet|r"
+    elseif knownInstance[kind] then
+        instance = "|cff40ff40live|r on instance " .. tostring(knownInstance[kind])
+    else
+        instance = "readable, but this proc's instance is unknown"
+    end
+
+    -- Per id, because "absent" and "restricted" mean completely different things
+    -- and one id answering where another does not is the normal case.
+    local reads = {}
+    for _, id in ipairs(ViewerAuraIDs(kind)) do
+        local st, why = ReadAura(id)
+        table.insert(reads, string.format("%d=%s%s", id, why,
+            st and st.stacks and (" x" .. tostring(st.stacks)) or ""))
+    end
+
+    local _, status = ReadAuraAny(ViewerAuraIDs(kind))
+    print(string.format("   %s: %s", label,
+        DetectionLive(kind) and "|cff40ff40counting|r"
+                             or "|cffff8080blind -> falling back to consumption|r"))
+    print(string.format("      aura: %s (%s) | aura instance: %s",
+        status, table.concat(reads, ", "), instance))
+    print(string.format("      Cooldown Manager: %s", hook))
+end
+
 local function ShowStatus()
     Print("diagnostics:")
-    print(string.format("   build interface: %s", tostring(select(4, GetBuildInfo()))))
-    print(string.format("   spec id: %s (Arcane = %d)", tostring(CurrentSpecID()), ARCANE_SPEC_ID))
+    print(string.format("   build interface: %s | spec id: %s (Arcane = %d)",
+        tostring(select(4, GetBuildInfo())), tostring(CurrentSpecID()), ARCANE_SPEC_ID))
+
     for _, key in ipairs({ "blast", "barrage", "missiles", "ccAura", "pbCast", "pbAura" }) do
         print(string.format("   id.%s = %d (%s)", key, ID[key], SpellName(ID[key])))
     end
-    local cc, ccStatus = ReadAura(ID.ccAura)
-    local pb, pbStatus = ReadAura(ID.pbAura)
-    print(string.format("   Clearcasting aura: %s%s", ccStatus,
-        cc and string.format(" (stacks %s)", tostring(cc.stacks)) or ""))
-    print(string.format("   Prismatic Bolt aura: %s%s", pbStatus,
-        pb and string.format(" (stacks %s)", tostring(pb.stacks)) or ""))
-    print(string.format("   Clearcasting secrecy: %s", AuraSecrecy(ID.ccAura)))
-    print(string.format("   Prismatic Bolt secrecy: %s", AuraSecrecy(ID.pbAura)))
+    local learned = {}
+    for id in pairs(learnedPBCasts) do table.insert(learned, id) end
+    print(string.format("   learned override cast ids: %s | Blast override now: %s",
+        #learned > 0 and table.concat(learned, ", ") or "none", tostring(BlastOverride())))
+
+    print(string.format("   secrecy -> Clearcasting: %s | Prismatic Bolt: %s",
+        AuraSecrecy(ID.ccAura), AuraSecrecy(ID.pbAura)))
     if C_Secrets then
         print(string.format("   auras secret globally: %s | secret restrictions: %s",
             TryCall(C_Secrets.ShouldAurasBeSecret), TryCall(C_Secrets.HasSecretRestrictions)))
     end
-    print(string.format("   Arcane Missiles usable: %s (this is the aura-free Clearcasting signal)",
-        tostring(ReadUsable(ID.missiles))))
-    if C_Secrets then
-        print(string.format("   cooldowns secret: %s", TryCall(C_Secrets.ShouldCooldownsBeSecret)))
-    end
-    -- probes: if either of these ever tracks Clearcasting stacks it would close
-    -- the one remaining blind spot, so it is worth being able to see them.
-    if C_Spell then
-        print(string.format("   Missiles cast count: %s | charges: %s",
-            TryCall(C_Spell.GetSpellCastCount, ID.missiles),
-            TryCall(C_Spell.GetSpellCharges, ID.missiles)))
-    end
-    print(string.format("   Arcane Blast override: %s", tostring(BlastOverride())))
-    local learned = {}
-    for id in pairs(learnedPBCasts) do table.insert(learned, id) end
-    print(string.format("   learned override cast ids: %s", #learned > 0 and table.concat(learned, ", ") or "none"))
-    print(string.format("   Blast detection: %s   (aura readable: %s | stack held: %s)",
-        DetectionLive("blast") and "|cff40ff40live|r" or "|cffff8080blind -> falling back to consumption|r",
-        tostring(not AuraIsSecretNow(ID.ccAura)), tostring(missilesUsable)))
-    print(string.format("   Barrage detection: %s   (aura readable: %s | buff held: %s)",
-        DetectionLive("barrage") and "|cff40ff40live|r" or "|cffff8080blind -> falling back to consumption|r",
-        tostring(not AuraIsSecretNow(ID.pbAura)), tostring(lastOverride ~= nil)))
-    print(string.format("   last tracked cast: %s", tostring(lastBookedKind)))
+
+    DetectorLine("blast", "Arcane Blast / Clearcasting")
+    DetectorLine("barrage", "Arcane Barrage / Prismatic Bolt")
+    print(string.format("      Arcane Missiles castable: %s | last tracked cast: %s",
+        tostring(missilesUsable), tostring(lastBookedKind)))
+
     local soul, how = SoulActive()
     local now = GetTime()
     local when
     if now < soulFrom then when = string.format("in %.1fs", soulFrom - now)
     elseif now < soulTo then when = string.format("%.1fs left", soulTo - now)
     else when = "not expected" end
-    print(string.format("   Arcane Soul: %s%s | %s | aura %s",
-        soul and "|cff40ff40active|r" or "no", how and (" (" .. how .. ")") or "",
-        when, AuraSecrecy(ID.soulAura)))
+    -- "no" on its own read as "the buff is not up" whether or not the option was
+    -- even switched on, which is how you end up unsure whether the tick box does
+    -- anything. Say which of the two it is.
+    local soulState
+    if not DB.opts.soulPause then
+        soulState = "|cff9d9d9dskipping is off|r"
+    elseif soul then
+        soulState = "|cff40ff40active - casts and procs are being skipped|r"
+                    .. (how and (" (" .. how .. ")") or "")
+    else
+        soulState = "skipping is on, window not up"
+    end
+    print(string.format("   Arcane Soul: %s | %s", soulState, when))
+
     print(string.format("   in fight: %s | chat summary: %s | debug: %s",
         inFight and "yes" or "no",
         DB.opts.reportCombat and "on" or "off",
         DB.opts.debug and "ON" or "off"))
+
+    if not (viewer.blast.proven and viewer.barrage.proven) and not instanceReadable then
+        print("   |cffffcc00Tip:|r no detector can see a proc landing on one you already hold. "
+            .. "Switch on Blizzard's Cooldown Manager with Clearcasting and Prismatic Bolt on a "
+            .. "tracked bar (Edit Mode -> Cooldown Manager -> Tracked Buffs).")
+    end
 end
 
--- Walks a frame tree and reports every FontString it finds, shown or not, so we
--- can locate where the Cooldown Manager keeps the stack digit. Shallow scans
--- miss it when the text lives on a nested sub-frame.
-local DumpFontStrings
-DumpFontStrings = function(frame, path, depth, out)
-    if depth > 4 or #out >= 40 then return end
-    pcall(function()
-        if frame.GetRegions then
-            for i, region in ipairs({ frame:GetRegions() }) do
-                if region and region.GetObjectType and region:GetObjectType() == "FontString" then
-                    local raw = region.GetText and region:GetText()
-                    local text = IsSecret(raw) and "<SECRET>" or tostring(raw)
-                    if text ~= "nil" and text ~= "" then
-                        local shown = (region.IsShown and region:IsShown()) and "" or " [hidden]"
-                        table.insert(out, string.format("%s r%d = %q%s", path, i, text, shown))
+-- Everything the Cooldown Manager will tell us about itself, in one paste. When
+-- a detector reports "no entry" this is the command that says why: the category
+-- it is filed under, whether the frame exists, and what the items think their
+-- cooldownIDs are.
+local function ProbeViewer()
+    Print("Cooldown Manager dump:")
+    if not C_CooldownViewer then
+        print("   C_CooldownViewer: not present")
+        return
+    end
+    print(string.format("   available: %s", TryCall(C_CooldownViewer.IsCooldownViewerAvailable)))
+
+    local wanted = { [ID.ccAura] = "Clearcasting", [ID.pbAura] = "Prismatic Bolt!",
+                     [ID.pbCast] = "Prismatic Bolt (cast)" }
+    for _, category in ipairs(VIEWER_CATEGORIES) do
+        local ok, ids = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, category)
+        if ok and type(ids) == "table" and #ids > 0 then
+            print(string.format("   category %d: %d entries", category, #ids))
+            for _, id in ipairs(ids) do
+                local ok2, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, id)
+                if ok2 and type(info) == "table" then
+                    local spellID = TryCall(function() return info.spellID end)
+                    local override = TryCall(function() return info.overrideSpellID end)
+                    local linked = {}
+                    pcall(function()
+                        if type(info.linkedSpellIDs) == "table" then
+                            for _, s in ipairs(info.linkedSpellIDs) do
+                                table.insert(linked, tostring(s))
+                            end
+                        end
+                    end)
+                    local hasAura = TryCall(function() return info.hasAura end)
+                    local note = wanted[tonumber(spellID) or -1]
+                    -- only print what could matter, or a whole category is noise
+                    if note or wanted[tonumber(override) or -1] or #linked > 0 then
+                        print(string.format("      id %s -> spell %s%s | override %s | linked %s | hasAura %s",
+                            tostring(id), tostring(spellID), note and (" <" .. note .. ">") or "",
+                            tostring(override),
+                            #linked > 0 and table.concat(linked, ",") or "none",
+                            tostring(hasAura)))
                     end
                 end
             end
         end
-        -- named sub-objects are where Blizzard usually puts the count
-        for _, key in ipairs(STACK_TEXT_KEYS) do
-            local fs = frame[key]
-            if fs and fs.GetText then
-                local raw = fs:GetText()
-                local text = IsSecret(raw) and "<SECRET>" or tostring(raw)
-                table.insert(out, string.format("%s.%s = %q", path, key, text))
-            end
-        end
-        if frame.GetChildren then
-            for i, child in ipairs({ frame:GetChildren() }) do
-                DumpFontStrings(child, path .. ".c" .. i, depth + 1, out)
-            end
-        end
-    end)
-end
-
--- Dumps every avenue for reading a Clearcasting stack count, so one command in
--- the game answers what the documentation does not.
-local function ProbeStackSources()
-    Print("probing stack-count sources for %s:", SpellName(ID.ccAura))
-
-    print(string.format("   aura read: %s", (select(2, ReadAura(ID.ccAura)))))
-    local st = ReadAura(ID.ccAura)
-    print(string.format("   aura stacks: %s", tostring(st and st.stacks or "-")))
-    print(string.format("   Missiles usable: %s", tostring(ReadUsable(ID.missiles))))
-
-    if C_Spell then
-        print(string.format("   GetSpellCastCount(Missiles): %s", TryCall(C_Spell.GetSpellCastCount, ID.missiles)))
-        print(string.format("   GetSpellCastCount(Clearcasting): %s", TryCall(C_Spell.GetSpellCastCount, ID.ccAura)))
-        print(string.format("   GetSpellCharges(Missiles): %s", TryCall(C_Spell.GetSpellCharges, ID.missiles)))
     end
 
-    if not C_CooldownViewer then
-        print("   C_CooldownViewer: not present")
-    else
-        print(string.format("   viewer available: %s", TryCall(C_CooldownViewer.IsCooldownViewerAvailable)))
-        local id = ViewerIDForSpell(ID.ccAura)
-        print(string.format("   viewer cooldownID for Clearcasting: %s", tostring(id)))
-        if id then
-            local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, id)
-            if ok and type(info) == "table" then
-                for _, key in ipairs({ "spellID", "buffSlot", "hasAura", "selfAura", "charges", "isKnown", "isInvisible" }) do
-                    print(string.format("      info.%s = %s", key, TryCall(function() return info[key] end)))
-                end
-            end
-            local stacks, frameName = ViewerStacks(ID.ccAura)
-            print(string.format("   viewer displayed stacks: %s (from %s)", tostring(stacks), tostring(frameName)))
-
-            local item, owner = ViewerItemFor(id)
-            if item then
-                local out = {}
-                DumpFontStrings(item, "item", 1, out)
-                print(string.format("   text inside the Clearcasting item (%s):", tostring(owner)))
-                if #out == 0 then
-                    print("      (no FontStrings found at all)")
-                else
-                    for _, line in ipairs(out) do print("      " .. line) end
-                end
-            else
-                print("   no viewer item frame matched that cooldownID")
-            end
-        end
-    end
-
-    print(string.format("   aura ids tried: %s", table.concat(CC_AURA_IDS, ", ")))
-    for _, id in ipairs(CC_AURA_IDS) do
-        local st2, status2 = ReadAura(id)
-        print(string.format("      %d (%s): %s, stacks=%s, secretNow=%s", id, SpellName(id), status2,
-            tostring(st2 and st2.stacks or "-"), tostring(AuraIsSecretNow(id))))
-    end
-
-    -- what frames actually exist, and every number they are showing
     for _, frameName in ipairs(VIEWER_FRAMES) do
         local parent = _G[frameName]
         if not parent then
             print(string.format("   %s: absent", frameName))
         else
-            local ok, children = pcall(function() return { parent:GetChildren() } end)
-            local numbers, count = {}, 0
-            if ok then
+            local shown = TryCall(function() return parent:IsShown() end)
+            local okC, children = pcall(function() return { parent:GetChildren() } end)
+            local list = {}
+            if okC then
                 for _, item in ipairs(children) do
-                    count = count + 1
-                    local n = NumericTextOf(item)
-                    if n then table.insert(numbers, tostring(n)) end
+                    local cid = TryCall(function()
+                        if item.cooldownID ~= nil then return item.cooldownID end
+                        if item.GetCooldownID then return item:GetCooldownID() end
+                        return nil
+                    end)
+                    table.insert(list, tostring(cid))
                 end
             end
-            print(string.format("   %s: %d items, numbers shown: %s", frameName, count,
-                #numbers > 0 and table.concat(numbers, ",") or "none"))
+            print(string.format("   %s: shown %s, %d items -> %s", frameName,
+                tostring(shown), #list, #list > 0 and table.concat(list, ",") or "none"))
         end
     end
 
-    print("   |cffffff00Run this with 2 or 3 Clearcasting stacks up, in combat.|r")
+    for _, kind in ipairs(SHAME_KINDS) do
+        local v = viewer[kind]
+        print(string.format("   %s: cooldownID %s on %s, hooked %s, confirmed %s",
+            kind, tostring(v.cooldownID), tostring(v.ownerName),
+            tostring(v.hooked), tostring(v.proven)))
+    end
 end
 
 ShowStatusPublic = ShowStatus
@@ -2502,34 +3871,24 @@ end
 ----------------------------------------------------------------------
 -- Slash commands
 ----------------------------------------------------------------------
+-- Everything on this list is either something you would want in a macro, or
+-- something the settings panel cannot do. Anything that was only a second way to
+-- tick a box in the panel has been taken out: the panel is where settings live.
 local function ShowHelp()
     Print("commands:")
     print("   |cffffff00/adt|r - open the settings panel (or right-click the window)")
     print("   |cffffff00/adt toggle|r - show / hide the counter window")
-    print("   |cffffff00/adt stats|r - print totals")
     print("   |cffffff00/adt reset|r - clear all counters and history")
-    print("   |cffffff00/adt chat|r - after-fight summary in chat (off by default)")
-    print("   |cffffff00/adt report party|r (or raid / say) - send totals to chat")
-    print("   |cffffff00/adt history|r - open the fight history window (add |cffffff00chat|r for the text version)")
-    print("   |cffffff00/adt lock|r - lock / unlock dragging")
-    print("   |cffffff00/adt scale 1.2|r - window scale (0.5 - 2.0)")
-    print("   |cffffff00/adt alert 10|r - warn on a dry streak of 10 (0 = off)")
-    print("   |cffffff00/adt pb|r - count a Prismatic Bolt cast as an Arcane Blast cast (off by default)")
-    print("   |cffffff00/adt anyspec|r - show the window outside Arcane spec")
-    print("   |cffffff00/adt status|r - diagnostics: spell ids, aura readability")
-    print("   |cffffff00/adt scan|r - list your current buffs with spell ids")
-    print("   |cffffff00/adt probe|r - dump every way of reading a Clearcasting stack count")
-    print("   |cffffff00/adt debug|r - log every cast and proc to chat")
+    print("   |cffffff00/adt report|r - print your totals (add |cffffff00party|r, |cffffff00raid|r or |cffffff00say|r to send them)")
+    print("   |cffffff00/adt setup|r - run the first-time walkthrough again")
+    print("   |cffffff00everything else|r - in the settings panel: scale, alert, faces, sounds, history, colours")
+    print(" ")
+    print("   |cff9d9d9dif something looks wrong:|r")
+    print("   |cffffff00/adt status|r - which detector is doing the work, and what it can see")
+    print("   |cffffff00/adt probe|r - dump what the Cooldown Manager is tracking")
+    print("   |cffffff00/adt scan|r - list your current buffs with their spell ids")
+    print("   |cffffff00/adt debug|r - log every cast and proc decision to chat")
     print("   |cffffff00/adt setid pbaura 12345|r - patch a spell id (blast, barrage, missiles, ccaura, pbcast, pbaura)")
-end
-
-local function ShowHistory()
-    if #DB.history == 0 then Print("no fights recorded yet.") return end
-    Print("recent fights (newest first):")
-    for i, f in ipairs(DB.history) do
-        print(string.format("   %d) %s | Blast %d/%d dry | Barrage %d/%d dry",
-            i, FormatDuration(f.dur), f.blast.dry, f.blast.casts, f.barrage.dry, f.barrage.casts))
-    end
 end
 
 local ID_MAP = { blast = "blast", barrage = "barrage", missiles = "missiles",
@@ -2548,70 +3907,18 @@ local function HandleCommand(input)
         UpdateDisplay()
         if not DB.ui.shown and frame then frame:Hide() end
 
-    elseif cmd == "show" then
-        DB.ui.shown = true; UpdateDisplay()
-
-    elseif cmd == "hide" then
-        DB.ui.shown = false; if frame then frame:Hide() end
-
     elseif cmd == "reset" then
         ResetStats()
 
-    elseif cmd == "stats" then
-        ReportTotals(nil)
-
-    elseif cmd == "report" then
+    elseif cmd == "report" or cmd == "stats" then
         local channel
         if arg == "party" or arg == "raid" or arg == "say" or arg == "instance_chat" then
             channel = arg:upper()
         end
         ReportTotals(channel)
 
-    elseif cmd == "history" then
-        if arg == "chat" then
-            ShowHistory()
-        elseif ShowHistoryPublic then
-            ShowHistoryPublic()
-        else
-            ShowHistory()
-        end
-
-    elseif cmd == "lock" then
-        DB.ui.locked = not DB.ui.locked
-        Print("dragging: %s", DB.ui.locked and "locked" or "unlocked")
-
-    elseif cmd == "scale" then
-        local v = tonumber(arg)
-        if v and v >= 0.5 and v <= 2 then
-            DB.ui.scale = v
-            if frame then frame:SetScale(v) end
-            Print("scale: %.2f", v)
-        else
-            Print("give a value between 0.5 and 2.0")
-        end
-
-    elseif cmd == "alert" then
-        local v = tonumber(arg)
-        if v and v >= 0 then
-            DB.opts.alertThreshold = math.floor(v)
-            Print(v == 0 and "alert off." or string.format("alert at a dry streak of %d.", math.floor(v)))
-            UpdateDisplay()
-        else
-            Print("give a number (0 = off)")
-        end
-
-    elseif cmd == "chat" or cmd == "combat" then
-        DB.opts.reportCombat = not DB.opts.reportCombat
-        Print("after-fight summary in chat: %s", DB.opts.reportCombat and "on" or "off")
-
-    elseif cmd == "pb" then
-        DB.opts.countPrismatic = not DB.opts.countPrismatic
-        Print("Prismatic Bolt counts as an Arcane Blast cast: %s", DB.opts.countPrismatic and "yes" or "no")
-
-    elseif cmd == "anyspec" then
-        DB.opts.onlyArcane = not DB.opts.onlyArcane
-        Print("window limited to Arcane spec: %s", DB.opts.onlyArcane and "yes" or "no")
-        UpdateDisplay()
+    elseif cmd == "setup" then
+        if ShowSetup then ShowSetup() end
 
     elseif cmd == "status" then
         ShowStatus()
@@ -2620,7 +3927,7 @@ local function HandleCommand(input)
         ScanBuffs()
 
     elseif cmd == "probe" then
-        ProbeStackSources()
+        ProbeViewer()
 
     elseif cmd == "debug" then
         DB.opts.debug = not DB.opts.debug
@@ -2636,7 +3943,13 @@ local function HandleCommand(input)
             if field == "ccAura" then CC_AURA_IDS[1] = value end
             if field == "pbAura" then PB_AURA_IDS[1] = value end
             wipe(auraState)
+            wipe(auraBlind)
             wipe(viewerIDCache)
+            -- a different aura means a different Cooldown Manager item
+            for _, v in pairs(viewer) do
+                v.item, v.owner, v.ownerName = nil, nil, nil
+                v.hooked, v.proven, v.announced, v.checkedAt = false, false, false, 0
+            end
             Print("id.%s set to %d (%s)", field, value, SpellName(value))
         else
             Print("usage: /adt setid <blast|barrage|missiles|ccaura|pbcast|pbaura|soulaura|soultrigger> <spellID>")
@@ -2672,6 +3985,10 @@ events:SetScript("OnEvent", function(self, event, ...)
             -- these two used to default the other way round
             if prevVersion < 2 then DB.opts.reportCombat = false end
             if prevVersion < 3 then DB.opts.countPrismatic = false end
+            -- Skipping the Soul window is now the default, and an existing
+            -- profile has the old default written into it, so it needs saying
+            -- outright rather than left to CopyDefaults.
+            if prevVersion < 5 then DB.opts.soulPause = true end
         end
         DB.version = DB_VERSION
 
@@ -2720,12 +4037,21 @@ events:SetScript("OnEvent", function(self, event, ...)
 
         Print("loaded. |cffffff00/adt help|r for commands.")
 
+        -- The walkthrough waits: teaching someone to read a window they cannot
+        -- see is pointless, so it holds until they are Arcane and out of combat.
+        -- MaybeShowSetup is called again on spec change and on leaving combat.
+        MaybeShowSetup()
+
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _, _, spellID = ...
         lastAnyCast = GetTime()      -- gate for the usability signal
         OnCast(spellID)
 
     elseif event == "UNIT_AURA" then
+        -- The payload is mostly secret, but the instance id lists inside it are
+        -- not, and they are what reveals a buff being reapplied.
+        local _, updateInfo = ...
+        OnAuraUpdate(updateInfo)
         PollAll()
 
     elseif event == "SPELL_UPDATE_USABLE" then
@@ -2736,13 +4062,36 @@ events:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "PLAYER_REGEN_DISABLED" then
         OnCombatStart()
+        -- Nobody wants to be dragging frames around during a pull.
+        if setupUI.frame and setupUI.frame:IsShown() then
+            -- Flagged first: the frame's OnHide reads this to tell "combat took
+            -- it away" from "the player is done with it".
+            setupUI.interrupted = true
+            setupUI.frame:Hide()
+        end
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         OnCombatEnd()
         UpdateShameAll()
+        if setupUI.interrupted then
+            setupUI.interrupted = nil
+            if ShowSetup then ShowSetup() end
+        else
+            MaybeShowSetup()
+        end
 
     elseif event == "PLAYER_SPECIALIZATION_CHANGED" or event == "PLAYER_ENTERING_WORLD" then
+        MaybeShowSetup()
         wipe(auraState)
+        wipe(auraBlind)
+        wipe(knownInstance)
+        -- A fresh world means a fresh look at what this client will hand us. The
+        -- flag re-latches on the first aura change that carries readable lists.
+        instanceReadable, anonymousAdds = false, nil
+        -- A spec or zone change rebuilds the Cooldown Manager, so anything we
+        -- learned about its entries has to be looked up again.
+        wipe(viewerIDCache)
+        for _, v in pairs(viewer) do v.checkedAt = 0 end
         PollAll()
         UpdateDisplay()
     end
