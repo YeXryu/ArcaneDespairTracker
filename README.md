@@ -18,8 +18,6 @@ clown left — just suffering.
 In short: track the streak, count the Bolts, watch the face deteriorate, and accept that the
 game probably hates you.
 
-See [CHANGELOG.md](CHANGELOG.md) for what has changed and why.
-
 ## Install
 
 Unpack the `ArcaneDespairTracker` folder into `Interface/AddOns/`, so that
